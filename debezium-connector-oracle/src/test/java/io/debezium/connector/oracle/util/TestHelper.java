@@ -234,6 +234,16 @@ public class TestHelper {
                     builder.with(OracleConnectorConfig.LOG_MINING_BUFFER_EHCACHE_SCHEMA_CHANGES_CONFIG, getEhcacheBasicCacheConfig(cacheSize));
                     builder.with(OracleConnectorConfig.LOG_MINING_BUFFER_EHCACHE_EVENTS_CONFIG, getEhcacheBasicCacheConfig(cacheSize));
                 }
+                // If Infinispan is used as the spill provider, ensure infinispan config fragments exist
+                else if ("infinispan_embedded".equalsIgnoreCase(spillProvider)) {
+                    withDefaultInfinispanCacheConfigurations(LogMiningBufferType.INFINISPAN_EMBEDDED, builder);
+                }
+                else if ("infinispan_remote".equalsIgnoreCase(spillProvider)) {
+                    withDefaultInfinispanCacheConfigurations(LogMiningBufferType.INFINISPAN_REMOTE, builder);
+                    builder.with("log.mining.buffer." + ConfigurationProperties.SERVER_LIST, INFINISPAN_SERVER_LIST);
+                    builder.with("log.mining.buffer." + ConfigurationProperties.AUTH_USERNAME, INFINISPAN_USER);
+                    builder.with("log.mining.buffer." + ConfigurationProperties.AUTH_PASSWORD, INFINISPAN_PASS);
+                }
             }
 
             builder.withDefault(OracleConnectorConfig.LOG_MINING_BUFFER_DROP_ON_STOP, true);

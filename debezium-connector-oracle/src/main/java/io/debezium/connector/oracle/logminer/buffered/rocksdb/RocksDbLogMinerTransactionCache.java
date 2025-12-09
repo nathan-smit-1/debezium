@@ -48,6 +48,11 @@ public class RocksDbLogMinerTransactionCache extends AbstractLogMinerTransaction
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RocksDbLogMinerTransactionCache.class);
 
+    // Static byte arrays for column family names to avoid repeated allocations
+    private static final byte[] EVENTS_CF_NAME = "events".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] ROW_ID_INDEX_CF_NAME = "rowIdIndex".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] TRANSACTIONS_CF_NAME = "transactions".getBytes(StandardCharsets.UTF_8);
+
     private RocksDB db;
     private DBOptions dbOptions; // Keep reference for proper resource management
     private WriteOptions writeOptions; // Write options with WAL disabled for performance
@@ -101,30 +106,30 @@ public class RocksDbLogMinerTransactionCache extends AbstractLogMinerTransaction
             ColumnFamilyHandle txHandle = null;
 
             for (ColumnFamilyHandle handle : existingCFHandles) {
-                String name = new String(handle.getName(), StandardCharsets.UTF_8);
-                if ("events".equals(name)) {
+                byte[] name = handle.getName();
+                if (java.util.Arrays.equals(name, EVENTS_CF_NAME)) {
                     eventsHandle = handle;
                 }
-                else if ("rowIdIndex".equals(name)) {
+                else if (java.util.Arrays.equals(name, ROW_ID_INDEX_CF_NAME)) {
                     indexHandle = handle;
                 }
-                else if ("transactions".equals(name)) {
+                else if (java.util.Arrays.equals(name, TRANSACTIONS_CF_NAME)) {
                     txHandle = handle;
                 }
             }
 
             if (eventsHandle == null) {
-                ColumnFamilyDescriptor eventsDescriptor = new ColumnFamilyDescriptor("events".getBytes(StandardCharsets.UTF_8), new ColumnFamilyOptions());
+                ColumnFamilyDescriptor eventsDescriptor = new ColumnFamilyDescriptor(EVENTS_CF_NAME, new ColumnFamilyOptions());
                 eventsHandle = db.createColumnFamily(eventsDescriptor);
             }
 
             if (indexHandle == null) {
-                ColumnFamilyDescriptor indexDescriptor = new ColumnFamilyDescriptor("rowIdIndex".getBytes(StandardCharsets.UTF_8), new ColumnFamilyOptions());
+                ColumnFamilyDescriptor indexDescriptor = new ColumnFamilyDescriptor(ROW_ID_INDEX_CF_NAME, new ColumnFamilyOptions());
                 indexHandle = db.createColumnFamily(indexDescriptor);
             }
 
             if (txHandle == null) {
-                ColumnFamilyDescriptor txDescriptor = new ColumnFamilyDescriptor("transactions".getBytes(StandardCharsets.UTF_8), new ColumnFamilyOptions());
+                ColumnFamilyDescriptor txDescriptor = new ColumnFamilyDescriptor(TRANSACTIONS_CF_NAME, new ColumnFamilyOptions());
                 txHandle = db.createColumnFamily(txDescriptor);
             }
 

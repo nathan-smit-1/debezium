@@ -26,6 +26,9 @@ import io.debezium.connector.oracle.logminer.buffered.LogMinerCache;
 import io.debezium.connector.oracle.logminer.buffered.LogMinerTransactionCache;
 import io.debezium.connector.oracle.logminer.buffered.SpillStrategy;
 import io.debezium.connector.oracle.logminer.buffered.memory.MemoryBasedLogMinerCache;
+import io.debezium.util.Strings;
+
+import net.openhft.chronicle.queue.RollCycles;
 
 /**
  * Chronicle Queue-based cache provider implementation that creates Chronicle-backed transaction cache.
@@ -48,7 +51,7 @@ public class ChronicleCacheProvider extends AbstractCacheProvider<ChronicleTrans
         }
 
         String spillPath = connectorConfig.getLogMiningBufferSpillPath();
-        if (spillPath == null || spillPath.trim().isEmpty()) {
+        if (Strings.isNullOrEmpty(spillPath)) {
             throw new DebeziumException("Chronicle Queue spill path must be configured when spill is enabled");
         }
 
@@ -56,11 +59,11 @@ public class ChronicleCacheProvider extends AbstractCacheProvider<ChronicleTrans
         long spillThreshold = connectorConfig.getLogMiningBufferSpillThreshold();
         String rollCycle = connectorConfig.getChronicleRollCycle();
 
-        if (rollCycle == null || rollCycle.trim().isEmpty()) {
+        if (Strings.isNullOrEmpty(rollCycle)) {
             throw new DebeziumException("Chronicle roll cycle must be configured when spill is enabled");
         }
         try {
-            net.openhft.chronicle.queue.RollCycles.valueOf(rollCycle);
+            RollCycles.valueOf(rollCycle);
         }
         catch (IllegalArgumentException e) {
             throw new DebeziumException("Invalid Chronicle roll cycle name '" + rollCycle + "'", e);

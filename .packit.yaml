@@ -487,6 +487,56 @@ jobs:
   - job: tests
     trigger: pull_request
     # Suffix for job name
+    identifier: "oracle-19-memory-infinispan-embedded-spillover"
+    targets:
+      centos-stream-8-x86_64:
+        distros: [ "debezium-tf-1930" ]
+    skip_build: true
+    manual_trigger: true
+    labels:
+      - oracle
+      - oracle-logminer
+      - oracle-spillover
+      - oracle-infinispan-spillover
+    tf_extra_params:
+      test:
+        tmt:
+          name: oracle
+      environments:
+        - variables:
+            ORACLE_VERSION: 19.3.0
+            ORACLE_PROFILE_ARGS: "-Poracle-memory-infinispan-embedded-spillover -pl debezium-connector-oracle"
+            TEST_PROFILE: oracle
+
+  ###############################################################################################
+  - job: tests
+    trigger: pull_request
+    # Suffix for job name
+    identifier: "oracle-19-memory-infinispan-remote-spillover"
+    targets:
+      centos-stream-8-x86_64:
+        distros: [ "debezium-tf-1930" ]
+    skip_build: true
+    manual_trigger: true
+    labels:
+      - oracle
+      - oracle-logminer
+      - oracle-spillover
+      - oracle-infinispan-spillover
+    tf_extra_params:
+      test:
+        tmt:
+          name: oracle
+      environments:
+        - variables:
+            ORACLE_VERSION: 19.3.0
+            ORACLE_PROFILE_ARGS: "-Poracle-memory-infinispan-remote-spillover -pl debezium-connector-oracle"
+            TEST_PROFILE: oracle
+
+  ###############################################################################################
+  - job: tests
+    trigger: pull_request
+    # Suffix for job name
     identifier: "oracle-19-se"
     targets:
       centos-stream-8-x86_64:

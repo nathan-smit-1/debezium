@@ -5,6 +5,8 @@
  */
 package io.debezium.connector.oracle.logminer.buffered.chronicle;
 
+import java.math.BigDecimal;
+import java.nio.ByteBuffer;
 import java.time.Instant;
 
 import org.slf4j.Logger;
@@ -227,42 +229,40 @@ public class ChronicleEventSerializer {
                 valueOut.int8(VALUE_TYPE_UNAVAILABLE);
                 writeString(valueOut, UNAVAILABLE_VALUE_SENTINEL);
             }
-            else if (value instanceof String) {
+            else if (value instanceof String str) {
                 valueOut.int8(VALUE_TYPE_STRING);
-                writeString(valueOut, (String) value);
+                writeString(valueOut, str);
             }
-            else if (value instanceof Integer) {
+            else if (value instanceof Integer i) {
                 valueOut.int8(VALUE_TYPE_INTEGER);
-                valueOut.int32((Integer) value);
+                valueOut.int32(i);
             }
-            else if (value instanceof Long) {
+            else if (value instanceof Long l) {
                 valueOut.int8(VALUE_TYPE_LONG);
-                valueOut.int64((Long) value);
+                valueOut.int64(l);
             }
-            else if (value instanceof Double) {
+            else if (value instanceof Double d) {
                 valueOut.int8(VALUE_TYPE_DOUBLE);
-                valueOut.float64((Double) value);
+                valueOut.float64(d);
             }
-            else if (value instanceof Float) {
+            else if (value instanceof Float f) {
                 valueOut.int8(VALUE_TYPE_FLOAT);
-                valueOut.float32((Float) value);
+                valueOut.float32(f);
             }
-            else if (value instanceof Boolean) {
+            else if (value instanceof Boolean b) {
                 valueOut.int8(VALUE_TYPE_BOOLEAN);
-                valueOut.bool((Boolean) value);
+                valueOut.bool(b);
             }
-            else if (value instanceof java.math.BigDecimal) {
+            else if (value instanceof BigDecimal bd) {
                 valueOut.int8(VALUE_TYPE_BIG_DECIMAL);
-                writeString(valueOut, value.toString());
+                writeString(valueOut, bd.toString());
             }
-            else if (value instanceof byte[]) {
+            else if (value instanceof byte[] bytes) {
                 valueOut.int8(VALUE_TYPE_BYTES);
-                byte[] bytes = (byte[]) value;
                 valueOut.int32(bytes.length);
                 valueOut.bytes(bytes);
             }
-            else if (value instanceof java.nio.ByteBuffer) {
-                java.nio.ByteBuffer buffer = (java.nio.ByteBuffer) value;
+            else if (value instanceof ByteBuffer buffer) {
                 valueOut.int8(VALUE_TYPE_BYTES);
                 valueOut.int32(buffer.remaining());
                 byte[] bytes = new byte[buffer.remaining()];
@@ -301,7 +301,7 @@ public class ChronicleEventSerializer {
                 case VALUE_TYPE_BOOLEAN:
                     return valueIn.bool();
                 case VALUE_TYPE_BIG_DECIMAL:
-                    return new java.math.BigDecimal(readString(valueIn));
+                    return new BigDecimal(readString(valueIn));
                 case VALUE_TYPE_BYTES:
                     int length = valueIn.int32();
                     byte[] bytes = new byte[length];
@@ -371,7 +371,12 @@ public class ChronicleEventSerializer {
         @Override
         public LogMinerEvent readEvent(ValueIn valueIn) {
             byte eventTypeOrdinal = valueIn.int8();
-            EventType eventType = EventType.values()[eventTypeOrdinal];
+            EventType[] eventTypes = EventType.values();
+            if (eventTypeOrdinal < 0 || eventTypeOrdinal >= eventTypes.length) {
+                throw new DebeziumException("Invalid EventType ordinal: " + eventTypeOrdinal +
+                        ". Valid range is 0-" + (eventTypes.length - 1));
+            }
+            EventType eventType = eventTypes[eventTypeOrdinal];
 
             return readCommonFields(valueIn, eventType);
         }

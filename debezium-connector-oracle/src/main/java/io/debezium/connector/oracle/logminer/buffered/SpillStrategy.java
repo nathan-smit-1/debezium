@@ -25,9 +25,23 @@ public interface SpillStrategy {
      */
     boolean shouldSpill(String txId, LogMinerEvent latest, TransactionView view);
 
+    /**
+     * Called when a new transaction is created. This allows the strategy to initialize
+     * any per-transaction state or tracking required for spill decisions.
+     * The default implementation does nothing.
+     *
+     * @param txId the transaction ID of the newly created transaction
+     */
     default void onTransactionCreated(String txId) {
     }
 
+    /**
+     * Called when a transaction is removed from the cache. This allows the strategy to
+     * clean up any per-transaction state or tracking that was maintained for spill decisions.
+     * The default implementation does nothing.
+     *
+     * @param txId the transaction ID of the removed transaction
+     */
     default void onTransactionRemoved(String txId) {
     }
 }

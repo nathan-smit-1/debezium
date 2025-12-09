@@ -21,126 +21,126 @@ import io.debezium.connector.oracle.logminer.events.LogMinerEvent;
  */
 public class MemoryTransactionCacheAdapter<T extends Transaction> {
 
-    private final MemoryLogMinerTransactionCache inner;
-    private final Map<String, MemoryTransaction> txMap = new HashMap<>();
+    private final MemoryLogMinerTransactionCache delegate;
+    private final Map<String, MemoryTransaction> transactionsById = new HashMap<>();
 
     public MemoryTransactionCacheAdapter() {
         this(new MemoryLogMinerTransactionCache());
     }
 
-    public MemoryTransactionCacheAdapter(MemoryLogMinerTransactionCache inner) {
-        this.inner = inner == null ? new MemoryLogMinerTransactionCache() : inner;
+    public MemoryTransactionCacheAdapter(MemoryLogMinerTransactionCache delegate) {
+        this.delegate = delegate == null ? new MemoryLogMinerTransactionCache() : delegate;
     }
 
     public void addTransaction(T transaction) {
         MemoryTransaction memTx = new MemoryTransaction(transaction);
-        txMap.put(transaction.getTransactionId(), memTx);
-        inner.addTransaction(memTx);
+        transactionsById.put(transaction.getTransactionId(), memTx);
+        delegate.addTransaction(memTx);
     }
 
     /** For compatibility, allow adding a MemoryTransaction directly. */
     public void addTransaction(MemoryTransaction memTx) {
-        txMap.put(memTx.getTransactionId(), memTx);
-        inner.addTransaction(memTx);
+        transactionsById.put(memTx.getTransactionId(), memTx);
+        delegate.addTransaction(memTx);
     }
 
     public MemoryTransaction getTransaction(String transactionId) {
-        return txMap.get(transactionId);
+        return transactionsById.get(transactionId);
     }
 
     public void removeTransaction(MemoryTransaction memTx) {
         if (memTx == null) {
             return;
         }
-        txMap.remove(memTx.getTransactionId());
-        inner.removeTransaction(memTx);
+        transactionsById.remove(memTx.getTransactionId());
+        delegate.removeTransaction(memTx);
     }
 
     public void removeTransaction(T transaction) {
         String id = transaction.getTransactionId();
-        MemoryTransaction memTx = txMap.remove(id);
+        MemoryTransaction memTx = transactionsById.remove(id);
         if (memTx != null) {
-            inner.removeTransaction(memTx);
+            delegate.removeTransaction(memTx);
         }
     }
 
     public boolean containsTransaction(String transactionId) {
-        return txMap.containsKey(transactionId);
+        return transactionsById.containsKey(transactionId);
     }
 
     public boolean isEmpty() {
-        return txMap.isEmpty();
+        return transactionsById.isEmpty();
     }
 
     public int getTransactionCount() {
-        return txMap.size();
+        return transactionsById.size();
     }
 
     public <R> R streamTransactionsAndReturn(Function<Stream<MemoryTransaction>, R> consumer) {
-        return consumer.apply(txMap.values().stream());
+        return consumer.apply(transactionsById.values().stream());
     }
 
     public void transactions(Consumer<Stream<MemoryTransaction>> consumer) {
-        consumer.accept(txMap.values().stream());
+        consumer.accept(transactionsById.values().stream());
     }
 
     public void eventKeys(Consumer<Stream<String>> consumer) {
-        inner.eventKeys(consumer);
+        delegate.eventKeys(consumer);
     }
 
     public void forEachEvent(MemoryTransaction transaction,
                              io.debezium.connector.oracle.logminer.buffered.LogMinerTransactionCache.InterruptiblePredicate<LogMinerEvent> predicate)
             throws InterruptedException {
-        inner.forEachEvent(transaction, predicate);
+        delegate.forEachEvent(transaction, predicate);
     }
 
     public LogMinerEvent getTransactionEvent(MemoryTransaction transaction, int eventKey) {
-        return inner.getTransactionEvent(transaction, eventKey);
+        return delegate.getTransactionEvent(transaction, eventKey);
     }
 
     public MemoryTransaction getAndRemoveTransaction(String transactionId) {
-        MemoryTransaction tx = txMap.remove(transactionId);
+        MemoryTransaction tx = transactionsById.remove(transactionId);
         if (tx != null) {
-            inner.removeTransaction(tx);
+            delegate.removeTransaction(tx);
         }
         return tx;
     }
 
     public void addTransactionEvent(MemoryTransaction transaction, int eventKey, LogMinerEvent event) {
-        inner.addTransactionEvent(transaction, eventKey, event);
+        delegate.addTransactionEvent(transaction, eventKey, event);
     }
 
     public void removeTransactionEvents(MemoryTransaction transaction) {
-        inner.removeTransactionEvents(transaction);
-        txMap.remove(transaction.getTransactionId());
+        delegate.removeTransactionEvents(transaction);
+        transactionsById.remove(transaction.getTransactionId());
     }
 
     public boolean removeTransactionEventWithRowId(MemoryTransaction transaction, String rowId) {
-        return inner.removeTransactionEventWithRowId(transaction, rowId);
+        return delegate.removeTransactionEventWithRowId(transaction, rowId);
     }
 
     public boolean containsTransactionEvent(MemoryTransaction transaction, int eventKey) {
-        return inner.containsTransactionEvent(transaction, eventKey);
+        return delegate.containsTransactionEvent(transaction, eventKey);
     }
 
     public boolean removeTransactionEventWithEventKey(MemoryTransaction transaction, int eventKey) {
-        return inner.removeTransactionEventWithEventKey(transaction, eventKey);
+        return delegate.removeTransactionEventWithEventKey(transaction, eventKey);
     }
 
     public int getTransactionEventCount(MemoryTransaction transaction) {
-        return inner.getTransactionEventCount(transaction);
+        return delegate.getTransactionEventCount(transaction);
     }
 
     public int getTransactionEvents() {
-        return inner.getTransactionEvents();
+        return delegate.getTransactionEvents();
     }
 
     public void clear() {
-        txMap.clear();
-        inner.clear();
+        transactionsById.clear();
+        delegate.clear();
     }
 
     public void syncTransaction(MemoryTransaction transaction) {
-        inner.syncTransaction(transaction);
+        delegate.syncTransaction(transaction);
     }
 }

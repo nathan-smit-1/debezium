@@ -94,7 +94,7 @@ public class CompositeTransactionCache<T extends Transaction> extends AbstractLo
     // Core components
     private final LogMinerTransactionCache<T> spilloverCache;
     private final SpillStrategy spillStrategy;
-    private final io.debezium.connector.oracle.logminer.buffered.MemoryTransactionCacheAdapter<T> memoryEventStore;
+    private final MemoryTransactionCacheAdapter<T> memoryEventStore;
     // Single-threaded data structures (LogMiner processing is single-threaded)
     private final Map<String, T> transactionRegistry = new HashMap<>();
     private final Map<String, TransactionState> transactionStates = new HashMap<>();
@@ -122,7 +122,7 @@ public class CompositeTransactionCache<T extends Transaction> extends AbstractLo
         this.indexThreshold = indexThreshold;
 
         // Create memory event store internally (adapter maps provider transactions to memory)
-        this.memoryEventStore = new io.debezium.connector.oracle.logminer.buffered.MemoryTransactionCacheAdapter<>();
+        this.memoryEventStore = new MemoryTransactionCacheAdapter<>();
     }
 
     /**
@@ -225,7 +225,7 @@ public class CompositeTransactionCache<T extends Transaction> extends AbstractLo
     @Override
     public void eventKeys(Consumer<Stream<String>> consumer) {
         memoryEventStore
-                .eventKeys(memoryStream -> spilloverCache.eventKeys(spilloverStream -> consumer.accept(java.util.stream.Stream.concat(memoryStream, spilloverStream))));
+                .eventKeys(memoryStream -> spilloverCache.eventKeys(spilloverStream -> consumer.accept(Stream.concat(memoryStream, spilloverStream))));
     }
 
     @Override
@@ -307,8 +307,6 @@ public class CompositeTransactionCache<T extends Transaction> extends AbstractLo
                 // Check if we should start spilling
                 TransactionView view = new TransactionViewImpl(transactionId);
                 if (spillStrategy != null && spillStrategy.shouldSpill(transactionId, event, view)) {
-                    LOGGER.debug("Transaction {} is transitioning to spillover state.", transactionId);
-
                     // Transition to spilling state
                     transitionToSpilling(transaction);
 

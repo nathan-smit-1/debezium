@@ -77,6 +77,12 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
 
     protected final static long DEFAULT_RESUME_POSITION_INTERVAL = 10_000L;
 
+    // Buffer spill configuration constants
+    protected static final int SPILL_DISABLED_THRESHOLD = -1;
+    protected static final int DEFAULT_SPILL_IN_MEMORY_INDEX_THRESHOLD = 10000;
+    protected static final String DEFAULT_CHRONICLE_ROLL_CYCLE = "FAST_DAILY";
+    protected static final int DEFAULT_ROCKSDB_BATCH_FLUSH_THRESHOLD = 10000;
+
     public static final Field PORT = RelationalDatabaseConnectorConfig.PORT
             .withDefault(DEFAULT_PORT);
 
@@ -452,7 +458,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     public static final Field LOG_MINING_BUFFER_SPILL_IN_MEMORY_EVENTS_THRESHOLD = Field.create("log.mining.buffer.spill.in.memory.events.threshold")
             .withDisplayName("The number of events to keep in memory before spilling to disk")
             .withType(Type.INT)
-            .withDefault(-1)
+            .withDefault(SPILL_DISABLED_THRESHOLD)
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDescription("The maximum number of events to keep in memory before spilling to disk. " +
@@ -462,7 +468,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     public static final Field LOG_MINING_BUFFER_SPILL_IN_MEMORY_INDEX_THRESHOLD = Field.create("log.mining.buffer.spill.in.memory.index.threshold")
             .withDisplayName("The number of spilled events to index in memory before disabling the index")
             .withType(Type.INT)
-            .withDefault(10000)
+            .withDefault(DEFAULT_SPILL_IN_MEMORY_INDEX_THRESHOLD)
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDescription("The maximum number of spilled events to keep in the composite in-memory index per transaction. " +
@@ -479,7 +485,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     public static final Field LOG_MINING_BUFFER_CHRONICLE_ROLL_CYCLE = Field.create("log.mining.buffer.chronicle.roll.cycle")
             .withDisplayName("Chronicle Queue roll cycle")
             .withType(Type.STRING)
-            .withDefault("FAST_DAILY")
+            .withDefault(DEFAULT_CHRONICLE_ROLL_CYCLE)
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDescription("Chronicle Queue roll cycle setting. " +
@@ -490,7 +496,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
             .withType(Type.INT)
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
-            .withDefault(10000)
+            .withDefault(DEFAULT_ROCKSDB_BATCH_FLUSH_THRESHOLD)
             .withValidation(Field::isPositiveInteger)
             .withDescription("Number of pending writes after which RocksDB will perform a batch flush. Default 10.");
 
@@ -1809,9 +1815,61 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     }
 
     public enum LogMiningSpillProvider implements EnumeratedValue {
-        CHRONICLE("chronicle"),
-        ROCKSDB("rocksdb"),
-        EHCACHE("ehcache");
+        CHRONICLE("chronicle") {
+            @Override
+            public io.debezium.connector.oracle.logminer.buffered.CacheProvider<?> createCacheProvider(OracleConnectorConfig config) {
+                return new io.debezium.connector.oracle.logminer.buffered.chronicle.ChronicleCacheProvider(config);
+            }
+
+            @Override
+            public io.debezium.connector.oracle.logminer.buffered.TransactionFactory<?> createTransactionFactory() {
+                return new io.debezium.connector.oracle.logminer.buffered.chronicle.ChronicleTransactionFactory();
+            }
+        },
+        ROCKSDB("rocksdb") {
+            @Override
+            public io.debezium.connector.oracle.logminer.buffered.CacheProvider<?> createCacheProvider(OracleConnectorConfig config) {
+                return new io.debezium.connector.oracle.logminer.buffered.rocksdb.RocksDbCacheProvider(config);
+            }
+
+            @Override
+            public io.debezium.connector.oracle.logminer.buffered.TransactionFactory<?> createTransactionFactory() {
+                return new io.debezium.connector.oracle.logminer.buffered.rocksdb.RocksDbTransactionFactory();
+            }
+        },
+        EHCACHE("ehcache") {
+            @Override
+            public io.debezium.connector.oracle.logminer.buffered.CacheProvider<?> createCacheProvider(OracleConnectorConfig config) {
+                return new io.debezium.connector.oracle.logminer.buffered.ehcache.EhcacheCacheProvider(config);
+            }
+
+            @Override
+            public io.debezium.connector.oracle.logminer.buffered.TransactionFactory<?> createTransactionFactory() {
+                return new io.debezium.connector.oracle.logminer.buffered.ehcache.EhcacheTransactionFactory();
+            }
+        },
+        INFINISPAN_EMBEDDED("infinispan_embedded") {
+            @Override
+            public io.debezium.connector.oracle.logminer.buffered.CacheProvider<?> createCacheProvider(OracleConnectorConfig config) {
+                return new io.debezium.connector.oracle.logminer.buffered.infinispan.EmbeddedInfinispanCacheProvider(config);
+            }
+
+            @Override
+            public io.debezium.connector.oracle.logminer.buffered.TransactionFactory<?> createTransactionFactory() {
+                return new io.debezium.connector.oracle.logminer.buffered.infinispan.InfinispanTransactionFactory();
+            }
+        },
+        INFINISPAN_REMOTE("infinispan_remote") {
+            @Override
+            public io.debezium.connector.oracle.logminer.buffered.CacheProvider<?> createCacheProvider(OracleConnectorConfig config) {
+                return new io.debezium.connector.oracle.logminer.buffered.infinispan.RemoteInfinispanCacheProvider(config);
+            }
+
+            @Override
+            public io.debezium.connector.oracle.logminer.buffered.TransactionFactory<?> createTransactionFactory() {
+                return new io.debezium.connector.oracle.logminer.buffered.infinispan.InfinispanTransactionFactory();
+            }
+        };
 
         private final String value;
 
@@ -1823,6 +1881,10 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
         public String getValue() {
             return value;
         }
+
+        public abstract io.debezium.connector.oracle.logminer.buffered.CacheProvider<?> createCacheProvider(OracleConnectorConfig config);
+
+        public abstract io.debezium.connector.oracle.logminer.buffered.TransactionFactory<?> createTransactionFactory();
 
         public static LogMiningSpillProvider parse(String value) {
             if (value == null) {
