@@ -7,8 +7,13 @@ package io.debezium.connector.oracle.logminer.buffered;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.lang.management.ManagementFactory;
+import java.math.BigInteger;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
 
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
@@ -230,6 +235,77 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceIT exten
         }
         finally {
             TestHelper.dropTable(connection, "dbz8044");
+        }
+    }
+
+    @Test
+    @FixFor("DBZ-1553")
+    public void shouldAdvanceSessionLowerBoundsForLongRunningTransaction() throws Exception {
+        TestHelper.dropTable(connection, "dbz_session_bounds");
+        try {
+            connection.execute("CREATE TABLE dbz_session_bounds (id numeric(9,0) primary key, data varchar2(50))");
+            TestHelper.streamTable(connection, "dbz_session_bounds");
+
+            Configuration config = getBufferImplementationConfig()
+                    .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.DBZ_SESSION_BOUNDS")
+                    .with(OracleConnectorConfig.LOG_MINING_SESSION_MAX_TRANSACTION_AGE_MS, "60000")
+                    .build();
+
+            final LogInterceptor logInterceptor = new LogInterceptor(BufferedLogMinerStreamingChangeEventSource.class);
+            start(OracleConnector.class, config);
+            assertConnectorIsRunning();
+
+            waitForStreamingRunning(TestHelper.CONNECTOR_NAME, TestHelper.SERVER_NAME);
+
+            connection.executeWithoutCommitting("INSERT INTO dbz_session_bounds (id,data) values (1, 'test')");
+
+            final MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();
+            final ObjectName streamingMetricsName = new ObjectName(
+                    "debezium.oracle:type=connector-metrics,context=streaming,server=" + TestHelper.SERVER_NAME);
+
+            Thread.sleep(5000);
+
+            final BigInteger initialLowerBounds = (BigInteger) mBeanServer.getAttribute(
+                    streamingMetricsName, "MiningSessionLowerBounds");
+
+            try (OracleConnection secondary = TestHelper.testConnection()) {
+                secondary.execute("INSERT INTO dbz_session_bounds (id,data) values (2, 'committed')");
+            }
+
+            SourceRecords records = consumeRecordsByTopic(1);
+            assertThat(records.allRecordsInOrder()).hasSize(1);
+            List<SourceRecord> tableRecords = records.recordsForTopic("server1.DEBEZIUM.DBZ_SESSION_BOUNDS");
+            assertThat(tableRecords).hasSize(1);
+            Struct after = ((Struct) tableRecords.get(0).value()).getStruct(Envelope.FieldName.AFTER);
+            assertThat(after.get("ID")).isEqualTo(2);
+
+            // Wait for transaction to exceed the 60-second threshold plus check interval (60/4 = 15 seconds)
+            Thread.sleep(65000);
+
+            Awaitility.await()
+                    .atMost(30, TimeUnit.SECONDS)
+                    .pollInterval(5, TimeUnit.SECONDS)
+                    .until(() -> logInterceptor.containsMessage("Long-running transactions detected"));
+
+            final BigInteger adjustedLowerBounds = (BigInteger) mBeanServer.getAttribute(
+                    streamingMetricsName, "MiningSessionLowerBounds");
+
+            assertThat(adjustedLowerBounds.compareTo(initialLowerBounds))
+                    .as("MiningSessionLowerBounds should have advanced after session bounds adjustment")
+                    .isGreaterThan(0);
+
+            connection.commit();
+
+            records = consumeRecordsByTopic(1);
+            assertThat(records.allRecordsInOrder()).hasSize(1);
+            tableRecords = records.recordsForTopic("server1.DEBEZIUM.DBZ_SESSION_BOUNDS");
+            assertThat(tableRecords).hasSize(1);
+            after = ((Struct) tableRecords.get(0).value()).getStruct(Envelope.FieldName.AFTER);
+            assertThat(after.get("ID")).isEqualTo(1);
+            assertThat(after.get("DATA")).isEqualTo("test");
+        }
+        finally {
+            TestHelper.dropTable(connection, "dbz_session_bounds");
         }
     }
 }

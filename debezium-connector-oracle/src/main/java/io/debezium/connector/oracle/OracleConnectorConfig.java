@@ -178,6 +178,22 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
             .withDescription("Duration in milliseconds to keep long running transactions in transaction buffer between log mining " +
                     "sessions. By default, all transactions are retained.");
 
+    public static final Field LOG_MINING_SESSION_MAX_TRANSACTION_AGE_MS = Field.create("log.mining.session.max.transaction.age.ms")
+            .withDisplayName("Maximum transaction age for session bounds (milliseconds)")
+            .withType(Type.LONG)
+            .withWidth(Width.MEDIUM)
+            .withImportance(Importance.MEDIUM)
+            .withDefault(0L)
+            .withValidation(OracleConnectorConfig::validateTransactionAgeThreshold)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 21))
+            .withDescription("Maximum age (in milliseconds) that a transaction can remain pending " +
+                    "before the session lower bound advances past it. The age is measured as the duration " +
+                    "between the transaction's start time and the current mining position. " +
+                    "When exceeded, the session and query lower bounds advance to the next oldest transaction " +
+                    "within the threshold, but the exceeding transaction remains tracked for eventual commit. " +
+                    "The stored offset stays at a safe recovery point. Set to 0 to disable (default). " +
+                    "When enabled, must be at least 60000 (1 minute).");
+
     public static final Field RAC_NODES = Field.create("rac.nodes")
             .withDisplayName("Oracle RAC nodes")
             .withType(Type.STRING)
@@ -811,6 +827,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     LOG_MINING_SLEEP_TIME_MAX_MS,
                     LOG_MINING_SLEEP_TIME_INCREMENT_MS,
                     LOG_MINING_TRANSACTION_RETENTION_MS,
+                    LOG_MINING_SESSION_MAX_TRANSACTION_AGE_MS,
                     LOG_MINING_ARCHIVE_LOG_ONLY_MODE,
                     LOB_ENABLED,
                     LOG_MINING_USERNAME_INCLUDE_LIST,
@@ -912,6 +929,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     private final Duration logMiningSleepTimeDefault;
     private final Duration logMiningSleepTimeIncrement;
     private final Duration logMiningTransactionRetention;
+    private final long logMiningSessionMaxTransactionAgeMs;
     private final boolean archiveLogOnlyMode;
     private final Duration archiveLogOnlyScnPollTime;
     private final boolean lobEnabled;
@@ -997,6 +1015,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
         this.logMiningSleepTimeDefault = Duration.ofMillis(config.getInteger(LOG_MINING_SLEEP_TIME_DEFAULT_MS));
         this.logMiningSleepTimeIncrement = Duration.ofMillis(config.getInteger(LOG_MINING_SLEEP_TIME_INCREMENT_MS));
         this.logMiningTransactionRetention = config.getDuration(LOG_MINING_TRANSACTION_RETENTION_MS, ChronoUnit.MILLIS);
+        this.logMiningSessionMaxTransactionAgeMs = config.getLong(LOG_MINING_SESSION_MAX_TRANSACTION_AGE_MS);
         this.archiveLogOnlyMode = config.getBoolean(LOG_MINING_ARCHIVE_LOG_ONLY_MODE);
         this.logMiningUsernameIncludes = Strings.setOfTrimmed(config.getString(LOG_MINING_USERNAME_INCLUDE_LIST), String::new);
         this.logMiningUsernameExcludes = Strings.setOfTrimmed(config.getString(LOG_MINING_USERNAME_EXCLUDE_LIST), String::new);
@@ -1878,6 +1897,13 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     }
 
     /**
+     * @return the maximum age (in milliseconds) that a transaction can remain pending before the session lower bound advances past it
+     */
+    public long getLogMiningSessionMaxTransactionAgeMs() {
+        return logMiningSessionMaxTransactionAgeMs;
+    }
+
+    /**
      * @return true if the connector is to mine archive logs only, false to mine all logs.
      */
     public boolean isArchiveLogOnlyMode() {
@@ -2298,6 +2324,19 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     return 1;
                 }
             }
+        }
+        return 0;
+    }
+
+    private static int validateTransactionAgeThreshold(Configuration config, Field field, ValidationOutput problems) {
+        final long value = config.getLong(field);
+        if (value < 0) {
+            LOGGER.error("The option '{}' must be non-negative", field.name());
+            return 1;
+        }
+        if (value > 0 && value < 60000) {
+            LOGGER.error("The option '{}' must be either 0 (disabled) or at least 60000 (1 minute), but was {}", field.name(), value);
+            return 1;
         }
         return 0;
     }

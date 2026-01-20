@@ -82,6 +82,7 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
 
     private Instant lastProcessedScnChangeTime = null;
     private Scn lastProcessedScn = Scn.NULL;
+    private SessionBoundsAdjuster sessionBoundsAdjuster = null;
 
     public BufferedLogMinerStreamingChangeEventSource(OracleConnectorConfig connectorConfig,
                                                       OracleConnection jdbcConnection,
@@ -134,6 +135,33 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
                     LOGGER.debug("Requested delay of mining by one iteration");
                     pauseBetweenMiningSessions();
                     continue;
+                }
+
+                // Check if session bounds need adjustment for long-running transactions
+                final long maxTransactionAgeMilliseconds = getConfig().getLogMiningSessionMaxTransactionAgeMs();
+                if (maxTransactionAgeMilliseconds > 0) {
+                    // Lazy initialization of adjuster
+                    if (sessionBoundsAdjuster == null) {
+                        sessionBoundsAdjuster = new SessionBoundsAdjuster(maxTransactionAgeMilliseconds, getMetrics());
+                    }
+
+                    Optional<Scn> newLowerBound = sessionBoundsAdjuster.getNewLowerBound(
+                            getConnection(),
+                            getTransactionCache(),
+                            sessionEndScn,
+                            lastProcessedScn);
+
+                    if (newLowerBound.isPresent()) {
+                        LOGGER.warn("Long-running transactions detected (threshold: {} ms), advancing mining session lower bound from {} to {}.",
+                                maxTransactionAgeMilliseconds,
+                                sessionStartScn,
+                                newLowerBound.get());
+
+                        readScn = newLowerBound.get();
+                        sessionStartScn = newLowerBound.get();
+                        sessionStartScnChanged = true;
+                        getMetrics().setLastMiningSessionRange(sessionStartScn, sessionEndScn);
+                    }
                 }
 
                 flushStrategy.flush(getCurrentScn());
