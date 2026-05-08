@@ -152,6 +152,18 @@ public class CommitScn implements Comparable<Scn> {
         redoThreadCommitScns.put(row.getThread(), new RedoThreadCommitScn(row));
     }
 
+    public void recordCommit(int threadId, Scn scn, String transactionId) {
+        final RedoThreadCommitScn redoCommitScn = redoThreadCommitScns.get(threadId);
+        if (redoCommitScn != null) {
+            if (redoCommitScn.getCommitScn().compareTo(scn) == 0) {
+                redoCommitScn.getTxIds().add(transactionId);
+                return;
+            }
+        }
+
+        redoThreadCommitScns.put(threadId, new RedoThreadCommitScn(threadId, scn, Collections.singleton(transactionId)));
+    }
+
     /**
      * Set the commit scn across all redo threads.
      *

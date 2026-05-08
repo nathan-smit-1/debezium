@@ -33,7 +33,7 @@ import io.debezium.connector.oracle.OraclePartition;
 import io.debezium.connector.oracle.Scn;
 import io.debezium.connector.oracle.logminer.AbstractLogMinerStreamingChangeEventSource;
 import io.debezium.connector.oracle.logminer.LogFile;
-import io.debezium.connector.oracle.logminer.LogMinerChangeRecordEmitter;
+import io.debezium.connector.oracle.logminer.LogMinerEventDispatchHelper;
 import io.debezium.connector.oracle.logminer.LogMinerStreamingChangeEventSourceMetrics;
 import io.debezium.connector.oracle.logminer.SqlUtils;
 import io.debezium.connector.oracle.logminer.TransactionCommitConsumer;
@@ -48,10 +48,8 @@ import io.debezium.connector.oracle.logminer.events.DmlEvent;
 import io.debezium.connector.oracle.logminer.events.EventType;
 import io.debezium.connector.oracle.logminer.events.LogMinerEvent;
 import io.debezium.connector.oracle.logminer.events.LogMinerEventRow;
-import io.debezium.connector.oracle.logminer.events.RedoSqlDmlEvent;
 import io.debezium.connector.oracle.logminer.events.TruncateEvent;
 import io.debezium.connector.oracle.logminer.logwriter.LogWriterFlushStrategy;
-import io.debezium.data.Envelope;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.relational.Table;
@@ -125,7 +123,6 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
                 }
 
                 final Instant batchStartTime = Instant.now();
-                updateDatabaseTimeDifference();
 
                 if (sessionActive && !needsNewSession) {
                     boolean timeout = isMiningSessionRestartRequired(watch);
@@ -145,19 +142,16 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
                     dictionaryWritten = true;
                 }
 
-                Scn currentScn = getCurrentScn();
-                getMetrics().setCurrentScn(currentScn);
-
-                sessionEndScn = calculateUpperBounds(readScn, currentScn);
-                if (sessionEndScn.isNull()) {
+                final var miningWindow = prepareBoundedLogMiningWindow(readScn, sessionStartScn);
+                if (miningWindow.isEmpty()) {
                     LOGGER.debug("Requested delay of mining by one iteration");
                     pauseBetweenMiningSessions();
                     continue;
                 }
 
-                flushStrategy.flush(getCurrentScn());
+                sessionEndScn = miningWindow.get().finalUpperBoundScn();
 
-                sessionEndScn = collectLogsAndFinalUpperBoundary(sessionStartScn, sessionEndScn);
+                flushStrategy.flush(getCurrentScn());
                 if (!needsNewSession && hasSessionLogFilesChanged()) {
                     endMiningSession();
                     needsNewSession = true;
@@ -468,61 +462,22 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
                     }
                 }
 
-                getOffsetContext().setEventScn(event.getScn());
-                getOffsetContext().setEventCommitScn(row.getScn());
-                getOffsetContext().setTransactionId(transactionId);
-                getOffsetContext().setTransactionSequence(eventIndex);
-                getOffsetContext().setUserName(transaction.getUserName());
-                getOffsetContext().setSourceTime(event.getChangeTime().minusSeconds(databaseOffset.getTotalSeconds()));
-                getOffsetContext().setTableId(event.getTableId());
-                getOffsetContext().setRedoThread(row.getThread());
-                getOffsetContext().setRsId(event.getRsId());
-                getOffsetContext().setRowId(event.getRowIdAsString());
-                getOffsetContext().setCommitTime(row.getChangeTime().minusSeconds(databaseOffset.getTotalSeconds()));
-
-                if (eventIndex == 1) {
-                    getOffsetContext().setStartScn(event.getScn());
-                    getOffsetContext().setStartTime(event.getChangeTime().minusSeconds(databaseOffset.getTotalSeconds()));
-                }
-
-                if (event instanceof RedoSqlDmlEvent) {
-                    getOffsetContext().setRedoSql(((RedoSqlDmlEvent) event).getRedoSql());
-                }
-
-                final DmlEvent dmlEvent = (DmlEvent) event;
                 if (!skipEvents) {
-                    LogMinerChangeRecordEmitter logMinerChangeRecordEmitter;
-                    if (dmlEvent instanceof TruncateEvent) {
-                        // a truncate event is seen by logminer as a DDL event type.
-                        // So force this here to be a Truncate Operation.
-                        logMinerChangeRecordEmitter = new LogMinerChangeRecordEmitter(
-                                getConfig(),
-                                getPartition(),
-                                getOffsetContext(),
-                                Envelope.Operation.TRUNCATE,
-                                dmlEvent.getOldValues(),
-                                dmlEvent.getNewValues(),
-                                getSchema().tableFor(event.getTableId()),
-                                getSchema(),
-                                Clock.system());
-                    }
-                    else {
-                        logMinerChangeRecordEmitter = new LogMinerChangeRecordEmitter(
-                                getConfig(),
-                                getPartition(),
-                                getOffsetContext(),
-                                dmlEvent.getEventType(),
-                                dmlEvent.getOldValues(),
-                                dmlEvent.getNewValues(),
-                                getSchema().tableFor(event.getTableId()),
-                                getSchema(),
-                                Clock.system());
-                    }
-                    getEventDispatcher().dispatchDataChangeEvent(getPartition(), event.getTableId(), logMinerChangeRecordEmitter);
+                    LogMinerEventDispatchHelper.dispatchDataChangeEvent(
+                            getConfig(),
+                            getEventDispatcher(),
+                            getPartition(),
+                            getOffsetContext(),
+                            getSchema(),
+                            databaseOffset,
+                            transactionId,
+                            transaction.getUserName(),
+                            row.getThread(),
+                            row.getScn(),
+                            row.getChangeTime(),
+                            (DmlEvent) event,
+                            eventIndex);
                 }
-
-                // Clear redo SQL
-                getOffsetContext().setRedoSql(null);
             };
             try (TransactionCommitConsumer commitConsumer = new TransactionCommitConsumer(delegate, getConfig(), getSchema())) {
                 getTransactionCache().forEachEvent(transaction, (event, rolledBack) -> {
@@ -540,20 +495,16 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
             }
         }
 
-        getOffsetContext().getCommitScn().recordCommit(row);
-        getOffsetContext().setEventScn(commitScn);
-        getOffsetContext().setRsId(row.getRsId());
-        getOffsetContext().setRowId("");
-        getOffsetContext().setStartScn(Scn.NULL);
-        getOffsetContext().setCommitTime(null);
-        getOffsetContext().setStartTime(null);
-
-        if (dispatchTransactionCommittedEvent) {
-            getEventDispatcher().dispatchTransactionCommittedEvent(getPartition(), getOffsetContext(), transaction.getChangeTime());
-        }
-        else {
-            getEventDispatcher().dispatchHeartbeatEvent(getPartition(), getOffsetContext());
-        }
+        LogMinerEventDispatchHelper.finishCommittedTransaction(
+                getEventDispatcher(),
+                getPartition(),
+                getOffsetContext(),
+                row.getThread(),
+                transactionId,
+                commitScn,
+                row.getRsId(),
+                transaction != null ? transaction.getChangeTime() : row.getChangeTime(),
+                dispatchTransactionCommittedEvent);
 
         getBatchMetrics().commitObserved();
 

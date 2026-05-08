@@ -315,6 +315,9 @@ public abstract class AbstractLogMinerStreamingChangeEventSource
         return currentLogFiles;
     }
 
+    protected record BoundedLogMiningWindow(Scn upperBoundScn, Scn finalUpperBoundScn, List<LogFile> logFiles) {
+    }
+
     protected boolean hasSessionLogFilesChanged() {
         return sessionLogFilesChanged;
     }
@@ -999,6 +1002,31 @@ public abstract class AbstractLogMinerStreamingChangeEventSource
     }
 
     /**
+     * Prepares the next bounded mining window by resolving the current SCN, applying the shared
+     * upper-bound logic, and collecting the logs required for the session.
+     *
+     * @param upperBoundsStartScn the lower bound used when calculating the capped upper SCN
+     * @param logCollectionStartScn the lower bound used when collecting logs for the session
+     * @return the prepared bounded mining window, or {@link Optional#empty()} if the caller should delay
+     * @throws SQLException if the mining window cannot be prepared
+     */
+    protected Optional<BoundedLogMiningWindow> prepareBoundedLogMiningWindow(Scn upperBoundsStartScn, Scn logCollectionStartScn) throws SQLException {
+        updateDatabaseTimeDifference();
+
+        final Scn currentScn = getCurrentScn();
+        getMetrics().setCurrentScn(currentScn);
+
+        final Scn upperBoundScn = calculateUpperBounds(upperBoundsStartScn, currentScn);
+        if (upperBoundScn.isNull()) {
+            return Optional.empty();
+        }
+
+        final Scn finalUpperBoundScn = collectLogsAndFinalUpperBoundary(logCollectionStartScn, upperBoundScn);
+        final List<LogFile> logFiles = getCurrentLogFiles() == null ? List.of() : List.copyOf(getCurrentLogFiles());
+        return Optional.of(new BoundedLogMiningWindow(upperBoundScn, finalUpperBoundScn, logFiles));
+    }
+
+    /**
      * Get the database's current maximum system change number.
      *
      * @return the database current maximum system change number
@@ -1245,31 +1273,23 @@ public abstract class AbstractLogMinerStreamingChangeEventSource
     protected void dispatchSchemaChangeEventInternal(LogMinerEventRow event) throws InterruptedException {
         final TableId tableId = event.getTableId();
 
-        getOffsetContext().setEventScn(event.getScn()); // todo: check if this breaks unbuffered
-        getOffsetContext().setRedoThread(event.getThread());
-        getOffsetContext().setRsId(event.getRsId());
-        getOffsetContext().setRowId("");
-        getOffsetContext().setTransactionSequence(event.getTransactionSequence());
-
-        getEventDispatcher().dispatchSchemaChangeEvent(
+        LogMinerEventDispatchHelper.dispatchSchemaChangeEvent(
+                getConfig(),
+                getEventDispatcher(),
                 getPartition(),
                 getOffsetContext(),
-                tableId,
-                new OracleSchemaChangeEventEmitter(
-                        getConfig(),
-                        getPartition(),
-                        getOffsetContext(),
-                        tableId,
-                        tableId.catalog(),
-                        tableId.schema(),
-                        event.getObjectId(),
-                        // ALTER TABLE does not populate the data object id, pass object id on purpose
-                        event.getObjectId(),
+                getSchema(),
+                getMetrics(),
+                () -> handleTruncateEvent(event),
+                new io.debezium.connector.oracle.logminer.concurrent.WorkerResult.SchemaChangeRecord(
+                        event.getScn(),
+                        event.getTableId(),
                         event.getRedoSql(),
-                        getSchema(),
                         event.getChangeTime(),
-                        getMetrics(),
-                        () -> handleTruncateEvent(event)));
+                        event.getThread(),
+                        event.getRsId(),
+                        event.getTransactionSequence(),
+                        event.getObjectId()));
 
         if (isUsingHybridStrategy()) {
             // Remove table from the column-based parser cache
