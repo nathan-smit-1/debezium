@@ -14,6 +14,7 @@ import io.debezium.connector.oracle.OraclePartition;
 import io.debezium.connector.oracle.OracleTaskContext;
 import io.debezium.connector.oracle.logminer.AbstractLogMinerStreamingAdapter;
 import io.debezium.connector.oracle.logminer.LogMinerStreamingChangeEventSourceMetrics;
+import io.debezium.connector.oracle.logminer.concurrent.ConcurrentBufferedLogMinerStreamingChangeEventSource;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
@@ -56,6 +57,17 @@ public class BufferedLogMinerAdapter extends AbstractLogMinerStreamingAdapter {
                                                                                       Configuration jdbcConfig,
                                                                                       LogMinerStreamingChangeEventSourceMetrics streamingMetrics,
                                                                                       SnapshotterService snapshotterService) {
+        if (connectorConfig.getLogMiningConcurrentReaders() > 1) {
+            return new ConcurrentBufferedLogMinerStreamingChangeEventSource(
+                    connectorConfig,
+                    connection,
+                    dispatcher,
+                    errorHandler,
+                    clock,
+                    schema,
+                    jdbcConfig,
+                    streamingMetrics);
+        }
         return new BufferedLogMinerStreamingChangeEventSource(
                 connectorConfig,
                 connection,

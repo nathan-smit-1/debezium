@@ -244,9 +244,22 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
     public List<SourceRecord> doPoll() throws InterruptedException {
         List<DataChangeEvent> records = queue.poll();
 
-        return records.stream()
+        final List<SourceRecord> sourceRecords = records.stream()
                 .map(DataChangeEvent::getRecord)
                 .collect(Collectors.toList());
+
+        if (!sourceRecords.isEmpty() && LOGGER.isInfoEnabled()) {
+            final SourceRecord firstRecord = sourceRecords.get(0);
+            final SourceRecord lastRecord = sourceRecords.get(sourceRecords.size() - 1);
+            LOGGER.info("Oracle task poll delivered batch: size={}, firstTopic={}, lastTopic={}, firstOffset={}, lastOffset={}",
+                    sourceRecords.size(),
+                    firstRecord.topic(),
+                    lastRecord.topic(),
+                    firstRecord.sourceOffset(),
+                    lastRecord.sourceOffset());
+        }
+
+        return sourceRecords;
     }
 
     @Override

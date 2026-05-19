@@ -720,6 +720,17 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
             .withDescription("Specifies the maximum memory in bytes the LogMiner session can use for performing SQL sort operations. " +
                     "Setting this to 0 (the default) uses the database's default SORT_AREA_SIZE.");
 
+    public static final Field LOG_MINING_CONCURRENT_READERS = Field.create("log.mining.concurrent.readers")
+            .withDisplayName("Number of concurrent LogMiner reader threads")
+            .withType(Type.INT)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.MEDIUM)
+            .withDefault(1)
+            .withValidation(Field::isPositiveInteger)
+            .withDescription("The number of concurrent LogMiner reader threads. When greater than 1, the connector mines " +
+                    "archive logs in parallel. Parallelism is only active when at least 2 archive logs are available " +
+                    "and no online redo log is in scope for the current wave. Default is 1 (single-threaded).");
+
     public static final Field LOG_MINING_LOG_COUNT_MIN = Field.create("log.mining.log.count.min")
             .withDisplayName("Minimum number of logs per redo thread to mine")
             .withType(Type.INT)
@@ -815,7 +826,8 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     LOG_MINING_REDO_THREAD_SCN_ADJUSTMENT,
                     LOG_MINING_HASH_AREA_SIZE,
                     LOG_MINING_SORT_AREA_SIZE,
-                    LOG_MINING_LOG_COUNT_MIN)
+                    LOG_MINING_LOG_COUNT_MIN,
+                    LOG_MINING_CONCURRENT_READERS)
             .events(SOURCE_INFO_STRUCT_MAKER,
                     SIGNAL_DATA_COLLECTION)
             .create();
@@ -889,6 +901,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     private final Long logMiningHashAreaSize;
     private final Long logMiningSortAreaSize;
     private final Integer logMiningMinimumLogCount;
+    private final Integer logMiningConcurrentReaders;
     private final ArchiveDestinationNameResolver destinationNameResolver;
     private final boolean logMiningBufferTrackRsId;
 
@@ -976,6 +989,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
         this.logMiningHashAreaSize = config.getLong(LOG_MINING_HASH_AREA_SIZE);
         this.logMiningSortAreaSize = config.getLong(LOG_MINING_SORT_AREA_SIZE);
         this.logMiningMinimumLogCount = config.getInteger(LOG_MINING_LOG_COUNT_MIN);
+        this.logMiningConcurrentReaders = config.getInteger(LOG_MINING_CONCURRENT_READERS);
         this.logMiningBufferTrackRsId = config.getBoolean(LOG_MINING_BUFFER_TRACK_RS_ID);
 
         this.logMiningEhCacheConfiguration = config.subset("log.mining.buffer.ehcache", false);
@@ -1864,6 +1878,13 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
      */
     public Duration getLogMiningWindowMaxMs() {
         return logMiningWindowMaxMs;
+    }
+
+    /**
+     * @return the number of concurrent LogMiner reader threads
+     */
+    public int getLogMiningConcurrentReaders() {
+        return logMiningConcurrentReaders;
     }
 
     /**
