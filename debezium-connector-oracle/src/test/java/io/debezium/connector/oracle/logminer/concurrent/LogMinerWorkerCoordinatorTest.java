@@ -97,8 +97,10 @@ class LogMinerWorkerCoordinatorTest {
     private static final Scn SCN_350 = Scn.valueOf(350);
     private static final Scn SCN_380 = Scn.valueOf(380);
     private static final Scn SCN_400 = Scn.valueOf(400);
+    private static final Scn SCN_450 = Scn.valueOf(450);
     private static final Scn SCN_480 = Scn.valueOf(480);
     private static final Scn SCN_500 = Scn.valueOf(500);
+    private static final Scn SCN_550 = Scn.valueOf(550);
     private static final Scn SCN_600 = Scn.valueOf(600);
     private static final Scn SCN_700 = Scn.valueOf(700);
     private static final Scn SCN_800 = Scn.valueOf(800);
@@ -164,6 +166,50 @@ class LogMinerWorkerCoordinatorTest {
                         SCN_300));
 
         assertThat(coordinator.hasPendingUnknownCommitTransactions()).isFalse();
+    }
+
+    @Test
+    void testMatchedOrphanDoesNotHideSeparateUnknownCommitTransaction() throws Exception {
+        final TestableCoordinator coordinator = createCoordinator(2);
+
+        runWaveWithSingleWorkerResult(coordinator,
+                workerResult(
+                        0,
+                        WorkUnitType.WORKER,
+                        List.of(),
+                        List.of(
+                                inherited(TX_A, SCN_100, SCN_200),
+                                inherited(TX_B, SCN_200, SCN_300)),
+                        List.of(orphanCommit(TX_A, SCN_350, SCN_300)),
+                        SCN_100,
+                        SCN_350));
+
+        assertThat(coordinator.getPendingInheritedTransactions())
+                .extracting(InheritedTransaction::transactionId)
+                .containsExactlyInAnyOrder(TX_A, TX_B);
+        assertThat(coordinator.getPendingOrphanCommits())
+                .extracting(OrphanCommit::transactionId)
+                .containsExactly(TX_A);
+        assertThat(coordinator.hasPendingUnknownCommitTransactions()).isTrue();
+
+        final List<WorkUnit> units = coordinator.planWorkUnits(List.of(
+                archiveLog("log1", SCN_100, SCN_200, 1),
+                archiveLog("log2", SCN_200, SCN_300, 2),
+                archiveLog("log3", SCN_300, SCN_400, 3)));
+
+        final List<WorkUnit> bridges = units.stream()
+                .filter(unit -> unit.type() == WorkUnitType.BRIDGE)
+                .toList();
+
+        assertThat(bridges).hasSize(1);
+        assertThat(bridges.get(0).inheritedTransactions())
+                .extracting(InheritedTransaction::transactionId)
+                .containsExactly(TX_A);
+        assertThat(coordinator.getPendingInheritedTransactions())
+                .extracting(InheritedTransaction::transactionId)
+                .containsExactly(TX_B);
+        assertThat(coordinator.getPendingOrphanCommits()).isEmpty();
+        assertThat(coordinator.hasPendingUnknownCommitTransactions()).isTrue();
     }
 
     // ==========================================================================
@@ -938,9 +984,50 @@ class LogMinerWorkerCoordinatorTest {
 
         final WorkUnit unit = coordinator.buildSerialWorkUnit(redoLogs, SCN_200, explicitUpperBound);
 
-        assertThat(unit.sessionStartScn()).isEqualTo(SCN_200);
+        assertThat(unit.sessionStartScn()).isEqualTo(SCN_100.subtract(Scn.ONE));
         assertThat(unit.sessionEndScn()).isEqualTo(explicitUpperBound);
         assertThat(unit.readStartScn()).isEqualTo(SCN_200);
+        assertThat(unit.readEndScn()).isEqualTo(explicitUpperBound);
+        assertThat(unit.inheritedTransactions()).containsExactly(unresolvedA);
+    }
+
+    @Test
+    void testBuildSerialWorkUnitTightensRedoOnlySessionStartWhenNoInheritedTransactions() {
+        final TestableCoordinator coordinator = createCoordinator(2);
+
+        final Scn readStartScn = Scn.valueOf(2_569_833);
+        final Scn explicitUpperBound = Scn.valueOf(2_572_551);
+        final List<LogFile> redoLogs = List.of(
+                redoLog("redo1", Scn.valueOf(2_357_865), TestHelper.SCN_MAX, 2));
+
+        final WorkUnit unit = coordinator.buildSerialWorkUnit(redoLogs, readStartScn, explicitUpperBound);
+
+        assertThat(unit.sessionStartScn()).isEqualTo(readStartScn);
+        assertThat(unit.sessionEndScn()).isEqualTo(explicitUpperBound);
+        assertThat(unit.readStartScn()).isEqualTo(readStartScn);
+        assertThat(unit.readEndScn()).isEqualTo(explicitUpperBound);
+        assertThat(unit.inheritedTransactions()).isEmpty();
+    }
+
+    @Test
+    void testBuildSerialWorkUnitUsesOldestInheritedStartWhenInheritedTransactionsRemain() throws Exception {
+        final TestableCoordinator coordinator = createCoordinator(2);
+
+        final Scn readStartScn = Scn.valueOf(2_569_833);
+        final Scn explicitUpperBound = Scn.valueOf(2_572_551);
+        final InheritedTransaction unresolvedA = inherited(TX_A, SCN_100, readStartScn);
+
+        runWaveWithSingleWorkerResult(coordinator,
+                workerResult(0, WorkUnitType.WORKER, List.of(), List.of(unresolvedA), List.of(), SCN_100, readStartScn));
+
+        final List<LogFile> redoLogs = List.of(
+                redoLog("redo1", Scn.valueOf(2_357_865), TestHelper.SCN_MAX, 2));
+
+        final WorkUnit unit = coordinator.buildSerialWorkUnit(redoLogs, readStartScn, explicitUpperBound);
+
+        assertThat(unit.sessionStartScn()).isEqualTo(SCN_100.subtract(Scn.ONE));
+        assertThat(unit.sessionEndScn()).isEqualTo(explicitUpperBound);
+        assertThat(unit.readStartScn()).isEqualTo(readStartScn);
         assertThat(unit.readEndScn()).isEqualTo(explicitUpperBound);
         assertThat(unit.inheritedTransactions()).containsExactly(unresolvedA);
     }
@@ -1130,6 +1217,73 @@ class LogMinerWorkerCoordinatorTest {
         assertThat(coordinator.pendingSchemaChanges()).singleElement()
                 .extracting(WorkerResult.SchemaChangeRecord::scn)
                 .isEqualTo(SCN_350);
+    }
+
+    @Test
+    void testBridgeFailureRecoveryRestoresOrphanAndInheritedStateBeforeRetry() throws Exception {
+        final TestableCoordinator coordinator = createCoordinator(2);
+        final Scn scn120 = Scn.valueOf(120);
+        final Scn scn299 = Scn.valueOf(299);
+        final Scn scn320 = Scn.valueOf(320);
+        final Scn scn340 = Scn.valueOf(340);
+        final Scn scn350 = Scn.valueOf(350);
+        final Scn scn500 = Scn.valueOf(500);
+
+        final InheritedTransaction inheritedA = inherited(TX_A, scn120, scn320, scn320);
+        final OrphanCommit orphanA = orphanCommit(TX_A, scn350, SCN_300);
+        final CommittedTransaction safeTx = committed(TX_B, SCN_210, SCN_250, "rs.safe", List.of(dmlEvent(SCN_230, "DEBEZIUM.T")));
+        final CommittedTransaction unsafeTx = committed(TX_C, SCN_300, scn340, "rs.unsafe", List.of(dmlEvent(SCN_300, "DEBEZIUM.T")));
+        final CommittedTransaction bridgedTx = committed(TX_A, scn120, scn350, "rs.bridge", List.of(dmlEvent(SCN_150, "DEBEZIUM.T")));
+
+        final List<LogFile> waveLogs = List.of(
+                archiveLog("log1", SCN_100, SCN_200, 1),
+                archiveLog("log2", SCN_200, SCN_300, 2),
+                archiveLog("log3", SCN_300, SCN_400, 3),
+                archiveLog("log4", SCN_400, scn500, 4));
+
+        coordinator.enqueueResults(
+                workerResult(0, WorkUnitType.WORKER, List.of(safeTx, unsafeTx), List.of(inheritedA), List.of(orphanA), scn299, SCN_300, scn500));
+
+        coordinator.executeWave(waveLogs, dispatcher, partition, offsetContext, ZONE_UTC);
+
+        verify(dispatcher, times(1)).dispatchTransactionCommittedEvent(eq(partition), any(), any());
+        assertThat(coordinator.getPendingInheritedTransactions())
+                .extracting(InheritedTransaction::transactionId)
+                .containsExactly(TX_A);
+        assertThat(coordinator.getPendingOrphanCommits())
+                .extracting(OrphanCommit::transactionId)
+                .containsExactly(TX_A);
+        assertThat(coordinator.hasPendingReplayUnits()).isTrue();
+
+        coordinator.enqueueFailure(new RuntimeException("Simulated bridge failure"));
+
+        try {
+            coordinator.executePendingBridges(waveLogs, dispatcher, partition, offsetContext, ZONE_UTC);
+            assertThat(false).as("Expected RuntimeException to be thrown").isTrue();
+        }
+        catch (RuntimeException expected) {
+            assertThat(expected.getMessage()).contains("Simulated bridge failure");
+        }
+
+        assertThat(coordinator.getPendingInheritedTransactions())
+                .extracting(InheritedTransaction::transactionId)
+                .containsExactly(TX_A);
+        assertThat(coordinator.getPendingOrphanCommits())
+                .extracting(OrphanCommit::transactionId)
+                .containsExactly(TX_A);
+        assertThat(coordinator.hasPendingBridgeTransactions()).isTrue();
+        assertThat(coordinator.hasPendingReplayUnits()).isTrue();
+        verify(dispatcher, times(1)).dispatchTransactionCommittedEvent(eq(partition), any(), any());
+
+        coordinator.enqueueResults(
+                workerResult(0, WorkUnitType.BRIDGE, List.of(bridgedTx), List.of(), List.of(), scn320, SCN_300, scn350));
+
+        coordinator.executePendingBridges(waveLogs, dispatcher, partition, offsetContext, ZONE_UTC);
+
+        verify(dispatcher, times(2)).dispatchTransactionCommittedEvent(eq(partition), any(), any());
+        assertThat(coordinator.getPendingInheritedTransactions()).isEmpty();
+        assertThat(coordinator.getPendingOrphanCommits()).isEmpty();
+        assertThat(coordinator.hasPendingReplayUnits()).isFalse();
     }
 
     // ==========================================================================
@@ -1392,6 +1546,46 @@ class LogMinerWorkerCoordinatorTest {
     }
 
     @Test
+    void testExecuteWaveFiltersWorkerTransactionExactlyAtKnownUnsafeUpperBoundary() throws Exception {
+        final TestableCoordinator coordinator = createCoordinator(2);
+        final Scn scn120 = Scn.valueOf(120);
+        final Scn scn320 = Scn.valueOf(320);
+        final Scn scn350 = Scn.valueOf(350);
+        final Scn scn500 = Scn.valueOf(500);
+
+        final InheritedTransaction inheritedA = inherited(TX_A, scn120, scn320, scn320);
+        final OrphanCommit orphanA = orphanCommit(TX_A, scn350, SCN_300);
+        final CommittedTransaction safeTx = committed(TX_B, SCN_210, SCN_250, "rs.safe", List.of(dmlEvent(SCN_230, "DEBEZIUM.T")));
+        final CommittedTransaction boundaryTx = committed(TX_C, SCN_300, scn350, "rs.boundary", List.of(dmlEvent(SCN_300, "DEBEZIUM.T")));
+        final CommittedTransaction bridgedTx = committed(TX_A, scn120, scn350, "rs.bridge", List.of(dmlEvent(SCN_150, "DEBEZIUM.T")));
+
+        final List<LogFile> waveLogs = List.of(
+                archiveLog("log1", SCN_100, SCN_200, 1),
+                archiveLog("log2", SCN_200, SCN_300, 2),
+                archiveLog("log3", SCN_300, SCN_400, 3),
+                archiveLog("log4", SCN_400, scn500, 4));
+
+        coordinator.enqueueResults(
+                workerResult(0, WorkUnitType.WORKER, List.of(safeTx, boundaryTx), List.of(inheritedA), List.of(orphanA), SCN_300.subtract(Scn.ONE), SCN_200,
+                        scn500));
+
+        coordinator.executeWave(waveLogs, dispatcher, partition, offsetContext, ZONE_UTC);
+
+        verify(dispatcher, times(1)).dispatchTransactionCommittedEvent(eq(partition), any(), any());
+        assertThat(coordinator.hasPendingBridgeTransactions()).isTrue();
+        assertThat(coordinator.pendingDispatch()).isEmpty();
+
+        coordinator.enqueueResults(
+                workerResult(0, WorkUnitType.BRIDGE, List.of(bridgedTx, boundaryTx), List.of(), List.of(), scn320, SCN_300, scn350));
+
+        coordinator.executePendingBridges(waveLogs, dispatcher, partition, offsetContext, ZONE_UTC);
+
+        verify(dispatcher, times(3)).dispatchTransactionCommittedEvent(eq(partition), any(), any());
+        assertThat(coordinator.getPendingInheritedTransactions()).isEmpty();
+        assertThat(coordinator.getPendingOrphanCommits()).isEmpty();
+    }
+
+    @Test
     void testPlanReplayWorkUnitsBuildsTailAfterUnsafeInterval() throws Exception {
         final TestableCoordinator coordinator = createCoordinator(2);
         final Scn scn320 = Scn.valueOf(320);
@@ -1446,6 +1640,124 @@ class LogMinerWorkerCoordinatorTest {
         final WorkerResult noTailWorker = workerResult(1, WorkUnitType.WORKER, List.of(), List.of(), List.of(), scn299, SCN_300, scn350);
 
         assertThat(coordinator.planReplayWorkUnits(nextLogs, List.of(noTailWorker), plans)).isEmpty();
+    }
+
+    @Test
+    void testExactOnceDispatchAcrossArchiveRedoArchiveTransitions() throws Exception {
+        final TestableCoordinator coordinator = createCoordinator(2);
+
+        final CommittedTransaction txA = committed(TX_A, SCN_100, SCN_300, "rs.A",
+                List.of(dmlEvent(SCN_230, "DEBEZIUM.T")));
+        final CommittedTransaction txB = committed(TX_B, SCN_300, SCN_450, "rs.B",
+                List.of(dmlEvent(SCN_380, "DEBEZIUM.T")));
+        final CommittedTransaction txC = committed(TX_C, SCN_450, SCN_600, "rs.C",
+                List.of(dmlEvent(SCN_500, "DEBEZIUM.T")));
+
+        coordinator.enqueueResults(
+                workerResult(0, WorkUnitType.WORKER, List.of(txA), List.of(), List.of(), SCN_100, SCN_300));
+        coordinator.executeWave(twoArchiveLogs(), dispatcher, partition, offsetContext, ZONE_UTC);
+
+        coordinator.enqueueResults(
+                workerResult(0, WorkUnitType.WORKER, List.of(txB), List.of(), List.of(), SCN_300, SCN_450));
+        coordinator.executeSerial(
+                SCN_300,
+                SCN_450,
+                List.of(
+                        archiveLog("arc3", SCN_300, SCN_400, 3),
+                        redoLog("redo1", SCN_400, SCN_450, 4)),
+                dispatcher,
+                partition,
+                offsetContext,
+                ZONE_UTC);
+
+        coordinator.enqueueResults(
+                workerResult(0, WorkUnitType.WORKER, List.of(txC), List.of(), List.of(), SCN_450, SCN_600));
+        coordinator.executeWave(
+                List.of(
+                        archiveLog("arc4", SCN_450, SCN_500, 5),
+                        archiveLog("arc5", SCN_500, SCN_600, 6)),
+                dispatcher,
+                partition,
+                offsetContext,
+                ZONE_UTC);
+
+        verify(dispatcher, times(3)).dispatchTransactionCommittedEvent(eq(partition), any(), any());
+        assertThat(coordinator.getPendingInheritedTransactions()).isEmpty();
+        assertThat(coordinator.getPendingOrphanCommits()).isEmpty();
+    }
+
+    @Test
+    void testExactOnceDispatchAcrossArchiveRedoOscillation() throws Exception {
+        final TestableCoordinator coordinator = createCoordinator(2);
+
+        final List<CommittedTransaction> committedTransactions = List.of(
+                committed(TX_A, SCN_100, SCN_200, "rs.1", List.of(dmlEvent(SCN_150, "DEBEZIUM.T"))),
+                committed(TX_B, SCN_200, SCN_300, "rs.2", List.of(dmlEvent(SCN_250, "DEBEZIUM.T"))),
+                committed(TX_C, SCN_300, SCN_400, "rs.3", List.of(dmlEvent(SCN_350, "DEBEZIUM.T"))),
+                committed("TXDDD0004", SCN_400, SCN_500, "rs.4", List.of(dmlEvent(SCN_480, "DEBEZIUM.T"))),
+                committed("TXEEE0005", SCN_500, SCN_600, "rs.5", List.of(dmlEvent(SCN_500, "DEBEZIUM.T"))));
+
+        coordinator.enqueueResults(workerResult(0, WorkUnitType.WORKER, List.of(committedTransactions.get(0)), List.of(), List.of(), SCN_100, SCN_200));
+        coordinator.executeWave(List.of(
+                archiveLog("arc1", SCN_100, SCN_150, 1),
+                archiveLog("arc2", SCN_150, SCN_200, 2)), dispatcher, partition, offsetContext, ZONE_UTC);
+
+        coordinator.enqueueResults(workerResult(0, WorkUnitType.WORKER, List.of(committedTransactions.get(1)), List.of(), List.of(), SCN_200, SCN_300));
+        coordinator.executeSerial(SCN_200, SCN_300,
+                List.of(archiveLog("arc3", SCN_200, SCN_250, 3), redoLog("redo1", SCN_250, SCN_300, 4)),
+                dispatcher, partition, offsetContext, ZONE_UTC);
+
+        coordinator.enqueueResults(workerResult(0, WorkUnitType.WORKER, List.of(committedTransactions.get(2)), List.of(), List.of(), SCN_300, SCN_400));
+        coordinator.executeWave(List.of(
+                archiveLog("arc4", SCN_300, SCN_350, 5),
+                archiveLog("arc5", SCN_350, SCN_400, 6)), dispatcher, partition, offsetContext, ZONE_UTC);
+
+        coordinator.enqueueResults(workerResult(0, WorkUnitType.WORKER, List.of(committedTransactions.get(3)), List.of(), List.of(), SCN_400, SCN_500));
+        coordinator.executeSerial(SCN_400, SCN_500,
+                List.of(archiveLog("arc6", SCN_400, SCN_450, 7), redoLog("redo2", SCN_450, SCN_500, 8)),
+                dispatcher, partition, offsetContext, ZONE_UTC);
+
+        coordinator.enqueueResults(workerResult(0, WorkUnitType.WORKER, List.of(committedTransactions.get(4)), List.of(), List.of(), SCN_500, SCN_600));
+        coordinator.executeWave(List.of(
+                archiveLog("arc7", SCN_500, SCN_550, 9),
+                archiveLog("arc8", SCN_550, SCN_600, 10)), dispatcher, partition, offsetContext, ZONE_UTC);
+
+        verify(dispatcher, times(5)).dispatchTransactionCommittedEvent(eq(partition), any(), any());
+        assertThat(coordinator.getPendingInheritedTransactions()).isEmpty();
+        assertThat(coordinator.getPendingOrphanCommits()).isEmpty();
+    }
+
+    @Test
+    void testUnknownCommitTransactionSurvivesMultipleWavesThenResolvesOnce() throws Exception {
+        final TestableCoordinator coordinator = createCoordinator(2);
+
+        final InheritedTransaction unresolvedWave1 = inherited(TX_A, SCN_100, SCN_200);
+        final InheritedTransaction unresolvedWave2 = inherited(TX_A, SCN_100, SCN_300);
+        final CommittedTransaction resolved = committed(TX_A, SCN_100, SCN_400, "rs.A", List.of(dmlEvent(SCN_380, "DEBEZIUM.T")));
+
+        coordinator.enqueueResults(
+                workerResult(0, WorkUnitType.WORKER, List.of(), List.of(unresolvedWave1), List.of(), SCN_100, SCN_200));
+        coordinator.executeWave(twoArchiveLogs(), dispatcher, partition, offsetContext, ZONE_UTC);
+        verify(dispatcher, never()).dispatchTransactionCommittedEvent(eq(partition), any(), any());
+        assertThat(coordinator.hasPendingUnknownCommitTransactions()).isTrue();
+
+        coordinator.enqueueResults(
+                workerResult(0, WorkUnitType.WORKER, List.of(), List.of(unresolvedWave2), List.of(), SCN_200, SCN_300));
+        coordinator.executeSerial(SCN_200, SCN_300,
+                List.of(archiveLog("arc3", SCN_200, SCN_250, 3), redoLog("redo1", SCN_250, SCN_300, 4)),
+                dispatcher, partition, offsetContext, ZONE_UTC);
+        verify(dispatcher, never()).dispatchTransactionCommittedEvent(eq(partition), any(), any());
+        assertThat(coordinator.hasPendingUnknownCommitTransactions()).isTrue();
+
+        coordinator.enqueueResults(
+                workerResult(0, WorkUnitType.WORKER, List.of(resolved), List.of(), List.of(), SCN_300, SCN_400));
+        coordinator.executeSerial(SCN_300, SCN_400,
+                List.of(archiveLog("arc4", SCN_300, SCN_350, 5), redoLog("redo2", SCN_350, SCN_400, 6)),
+                dispatcher, partition, offsetContext, ZONE_UTC);
+
+        verify(dispatcher, times(1)).dispatchTransactionCommittedEvent(eq(partition), any(), any());
+        assertThat(coordinator.getPendingInheritedTransactions()).isEmpty();
+        assertThat(coordinator.getPendingOrphanCommits()).isEmpty();
     }
 
     @Test
@@ -1852,6 +2164,55 @@ class LogMinerWorkerCoordinatorTest {
         }
 
         @Override
+        public Scn executeSerial(Scn readStartScn,
+                                 Scn readEndScn,
+                                 List<LogFile> allLogs,
+                                 EventDispatcher<OraclePartition, TableId> dispatcher,
+                                 OraclePartition partition,
+                                 OracleOffsetContext offsetContext,
+                                 ZoneOffset databaseOffset) {
+            if (resultQueue.isEmpty()) {
+                return Scn.NULL;
+            }
+
+            final List<WorkerResult> results = resultQueue.remove(0);
+            if (results.isEmpty()) {
+                return Scn.NULL;
+            }
+
+            final WorkerResult result = results.get(0);
+            final List<InheritedTransaction> pendingInherited = getMutablePrivateList("pendingInheritedTransactions");
+            final List<OrphanCommit> pendingOrphans = getMutablePrivateList("pendingOrphanCommits");
+
+            final var resolvedIds = result.resolvedTransactions().stream()
+                    .map(CommittedTransaction::transactionId)
+                    .collect(java.util.stream.Collectors.toSet());
+
+            try {
+                for (CommittedTransaction transaction : result.resolvedTransactions()) {
+                    dispatcher.dispatchTransactionCommittedEvent(partition, offsetContext, transaction.commitTime());
+                }
+            }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Serial dispatch interrupted in test coordinator", e);
+            }
+
+            pendingInherited.removeIf(tx -> resolvedIds.contains(tx.transactionId()));
+            pendingOrphans.removeIf(orphan -> resolvedIds.contains(orphan.transactionId()));
+            pendingInherited.removeIf(tx -> result.unresolvedTransactions().stream().anyMatch(newTx -> newTx.transactionId().equals(tx.transactionId())));
+            pendingOrphans.removeIf(orphan -> result.orphanCommits().stream().anyMatch(newOrphan -> newOrphan.transactionId().equals(orphan.transactionId())));
+            pendingInherited.addAll(result.unresolvedTransactions());
+            pendingOrphans.addAll(result.orphanCommits());
+
+            if (!result.finalReadScn().isNull()) {
+                offsetContext.setScn(result.finalReadScn());
+            }
+
+            return result.finalReadScn();
+        }
+
+        @Override
         protected Scn mergeCompletedWorkerPrefix(List<LogFile> availableLogs,
                                                  List<WorkerResult> results,
                                                  EventDispatcher<OraclePartition, TableId> dispatcher,
@@ -1893,6 +2254,17 @@ class LogMinerWorkerCoordinatorTest {
             }
             catch (ReflectiveOperationException e) {
                 throw new RuntimeException("Failed to read field " + fieldName, e);
+            }
+        }
+
+        private <T> List<T> getMutablePrivateList(String fieldName) {
+            try {
+                final Field field = LogMinerWorkerCoordinator.class.getDeclaredField(fieldName);
+                field.setAccessible(true);
+                return (List<T>) field.get(this);
+            }
+            catch (ReflectiveOperationException e) {
+                throw new RuntimeException("Failed to read mutable field " + fieldName, e);
             }
         }
     }

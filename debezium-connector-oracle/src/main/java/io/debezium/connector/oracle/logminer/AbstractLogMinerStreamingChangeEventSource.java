@@ -39,7 +39,6 @@ import io.debezium.connector.oracle.Scn;
 import io.debezium.connector.oracle.logminer.LogFileCollector.LogFilesResult;
 import io.debezium.connector.oracle.logminer.LogFileSessionSelector.SessionLogSelection;
 import io.debezium.connector.oracle.logminer.LogMinerStreamingChangeEventSourceMetrics.BatchMetrics;
-import io.debezium.connector.oracle.logminer.events.DmlEvent;
 import io.debezium.connector.oracle.logminer.events.EventType;
 import io.debezium.connector.oracle.logminer.events.ExtendedStringBeginEvent;
 import io.debezium.connector.oracle.logminer.events.ExtendedStringWriteEvent;
@@ -47,7 +46,6 @@ import io.debezium.connector.oracle.logminer.events.LobEraseEvent;
 import io.debezium.connector.oracle.logminer.events.LobWriteEvent;
 import io.debezium.connector.oracle.logminer.events.LogMinerEvent;
 import io.debezium.connector.oracle.logminer.events.LogMinerEventRow;
-import io.debezium.connector.oracle.logminer.events.RedoSqlDmlEvent;
 import io.debezium.connector.oracle.logminer.events.SelectLobLocatorEvent;
 import io.debezium.connector.oracle.logminer.events.XmlBeginEvent;
 import io.debezium.connector.oracle.logminer.events.XmlEndEvent;
@@ -62,7 +60,6 @@ import io.debezium.connector.oracle.logminer.parser.LobWriteParser;
 import io.debezium.connector.oracle.logminer.parser.LobWriteParser.LobWrite;
 import io.debezium.connector.oracle.logminer.parser.LogMinerColumnResolverDmlParser;
 import io.debezium.connector.oracle.logminer.parser.LogMinerDmlEntry;
-import io.debezium.connector.oracle.logminer.parser.LogMinerDmlEntryImpl;
 import io.debezium.connector.oracle.logminer.parser.LogMinerDmlParser;
 import io.debezium.connector.oracle.logminer.parser.SelectLobParser;
 import io.debezium.connector.oracle.logminer.parser.XmlBeginParser;
@@ -988,8 +985,6 @@ public abstract class AbstractLogMinerStreamingChangeEventSource
         // This makes sure that specific LogMiner attributes are serialized in a consistent format
         // to minimize the various permutations needed in the value converters.
         setNlsSessionParameters();
-
-        setHashSortArea();
     }
 
     /**
@@ -1281,15 +1276,7 @@ public abstract class AbstractLogMinerStreamingChangeEventSource
                 getSchema(),
                 getMetrics(),
                 () -> handleTruncateEvent(event),
-                new io.debezium.connector.oracle.logminer.concurrent.WorkerResult.SchemaChangeRecord(
-                        event.getScn(),
-                        event.getTableId(),
-                        event.getRedoSql(),
-                        event.getChangeTime(),
-                        event.getThread(),
-                        event.getRsId(),
-                        event.getTransactionSequence(),
-                        event.getObjectId()));
+                LogMinerEventFactory.createSchemaChangeRecord(event));
 
         if (isUsingHybridStrategy()) {
             // Remove table from the column-based parser cache
@@ -1308,15 +1295,12 @@ public abstract class AbstractLogMinerStreamingChangeEventSource
      * @throws InterruptedException if the thread is interrupted
      */
     protected void dispatchDataChangeEventInternal(LogMinerEventRow event, Table table) throws InterruptedException {
-        final LogMinerDmlEntry parsedEvent = parseDmlStatement(event, table);
-        if (parsedEvent != null) {
-            parsedEvent.setObjectName(event.getTableName());
-            parsedEvent.setObjectOwner(event.getTablespaceName());
-
-            enqueueEvent(event, getConfig().isLogMiningIncludeRedoSql()
-                    ? new RedoSqlDmlEvent(event, parsedEvent, event.getRedoSql())
-                    : new DmlEvent(event, parsedEvent));
-
+        final LogMinerEvent dataChangeEvent = LogMinerEventFactory.createDataChangeEvent(
+                event,
+                () -> parseDmlStatement(event, table),
+                getConfig().isLogMiningIncludeRedoSql());
+        if (dataChangeEvent != null) {
+            enqueueEvent(event, dataChangeEvent);
             getMetrics().incrementTotalChangesCount();
         }
     }
@@ -1459,20 +1443,6 @@ public abstract class AbstractLogMinerStreamingChangeEventSource
             notifyEventProcessingFailure(event, e);
             return null;
         }
-    }
-
-    /**
-     * Parse a TRUNCATE event.
-     *
-     * @param event the event, should not be {@code null}
-     * @return the parsed entry, never {@code null}
-     */
-    protected LogMinerDmlEntry parseTruncateEvent(LogMinerEventRow event) {
-        final LogMinerDmlEntry parsedEvent = LogMinerDmlEntryImpl.forValuelessDdl();
-        parsedEvent.setObjectName(event.getTableName());
-        parsedEvent.setObjectOwner(event.getTablespaceName());
-
-        return parsedEvent;
     }
 
     /**
@@ -1730,34 +1700,7 @@ public abstract class AbstractLogMinerStreamingChangeEventSource
      * @throws SQLException if a database exception occurred
      */
     private void setNlsSessionParameters() throws SQLException {
-        final String NLS_SESSION_PARAMETERS = "ALTER SESSION SET "
-                + "  NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS'"
-                + "  NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF9'"
-                + "  NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM'"
-                + "  NLS_NUMERIC_CHARACTERS = '.,'";
-        jdbcConnection.executeWithoutCommitting(NLS_SESSION_PARAMETERS);
-
-        // This is necessary so that TIMESTAMP WITH LOCAL TIME ZONE is returned in UTC
-        jdbcConnection.executeWithoutCommitting("ALTER SESSION SET TIME_ZONE = '00:00'");
-    }
-
-    /**
-     * Sets the hash/sort area for the mining session.
-     *
-     * @throws SQLException the hash/sort area
-     */
-    private void setHashSortArea() throws SQLException {
-        final long hashAreaSize = getConfig().getLogMiningHashAreaSize();
-        if (hashAreaSize > 0) {
-            LOGGER.debug("Setting LogMiner connection HASH_AREA_SIZE={}", hashAreaSize);
-            jdbcConnection.executeWithoutCommitting("ALTER SESSION SET HASH_AREA_SIZE = " + hashAreaSize);
-        }
-
-        final long sortAreaSize = getConfig().getLogMiningSortAreaSize();
-        if (sortAreaSize > 0) {
-            LOGGER.debug("Setting LogMiner connection SORT_AREA_SIZE={}", sortAreaSize);
-            jdbcConnection.executeWithoutCommitting("ALTER SESSION SET SORT_AREA_SIZE = " + sortAreaSize);
-        }
+        LogMinerSessionHelper.configureSession(jdbcConnection, getConfig(), LOGGER);
     }
 
     /**

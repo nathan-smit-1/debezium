@@ -90,6 +90,7 @@ public class ConcurrentBufferedLogMinerStreamingChangeEventSource
 
         while (getContext().isRunning()) {
             waveNumber++;
+            final Scn logCollectionStartScn = getSerialLogCollectionStartScn(currentReadScn);
             // In archive-log-only mode, wait until the range is available
             if (getConfig().isArchiveLogOnlyMode()) {
                 if (waitForRangeAvailabilityInArchiveLogs(currentReadScn, Scn.NULL)) {
@@ -99,7 +100,7 @@ public class ConcurrentBufferedLogMinerStreamingChangeEventSource
 
             final Instant batchStartTime = Instant.now();
 
-            final var miningWindow = prepareBoundedLogMiningWindow(currentReadScn, currentReadScn);
+            final var miningWindow = prepareBoundedLogMiningWindow(currentReadScn, logCollectionStartScn);
             if (miningWindow.isEmpty()) {
                 LOGGER.debug("Upper bound calculation requested delay; pausing.");
                 pauseBetweenMiningSessions();
@@ -204,10 +205,29 @@ public class ConcurrentBufferedLogMinerStreamingChangeEventSource
                     currentReadScn = processedScn;
                 }
 
+                final boolean hasUnknownCommitContinuation = coordinator.hasPendingUnknownCommitTransactions();
+
+                if (hasUnknownCommitContinuation) {
+                    LOGGER.info(
+                            "Concurrent LogMiner wave {} executing serial continuation over logs {} because inherited transactions {} still have unknown commit locations",
+                            waveNumber,
+                            describeLogs(allLogs),
+                            coordinator.getPendingInheritedTransactions().stream()
+                                    .map(InheritedTransaction::transactionId)
+                                    .toList());
+                    final Scn serialProcessedScn = executeBoundedSerial(
+                            currentReadScn,
+                            finalUpperBound,
+                            allLogs,
+                            databaseOffset);
+                    if (!serialProcessedScn.isNull()) {
+                        currentReadScn = serialProcessedScn;
+                    }
+                }
                 // Phase 2: if online redo logs are in scope, process them serially as a
                 // follow-up. The serial worker inherits any open transactions from the
                 // concurrent archive phase so that cross-phase resolution works correctly.
-                if (!redoLogs.isEmpty()) {
+                else if (!redoLogs.isEmpty()) {
                     LOGGER.info("Concurrent LogMiner wave {} executing serial follow-up over redo logs {} with upperBound={}",
                             waveNumber, describeLogs(redoLogs), finalUpperBound);
                     final Scn redoProcessedScn = executeBoundedSerial(
@@ -292,6 +312,14 @@ public class ConcurrentBufferedLogMinerStreamingChangeEventSource
                 getPartition(),
                 getOffsetContext(),
                 databaseOffset);
+    }
+
+    private Scn getSerialLogCollectionStartScn(Scn defaultStartScn) {
+        return coordinator.getPendingInheritedTransactions().stream()
+                .map(InheritedTransaction::startScn)
+                .min(Scn::compareTo)
+                .map(startScn -> startScn.subtract(Scn.ONE))
+                .orElse(defaultStartScn);
     }
 
     // ------------------------------------------------------------------ required abstract method implementations

@@ -26,21 +26,21 @@ import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.OracleDatabaseSchema;
 import io.debezium.connector.oracle.Scn;
 import io.debezium.connector.oracle.logminer.LogFile;
+import io.debezium.connector.oracle.logminer.LogMinerEventFactory;
 import io.debezium.connector.oracle.logminer.LogMinerSessionContext;
+import io.debezium.connector.oracle.logminer.LogMinerSessionHelper;
+import io.debezium.connector.oracle.logminer.LogMinerTransactionCacheHelper;
 import io.debezium.connector.oracle.logminer.buffered.BufferedLogMinerQueryBuilder;
 import io.debezium.connector.oracle.logminer.buffered.memory.MemoryCacheProvider;
 import io.debezium.connector.oracle.logminer.buffered.memory.MemoryTransaction;
 import io.debezium.connector.oracle.logminer.buffered.memory.MemoryTransactionFactory;
-import io.debezium.connector.oracle.logminer.events.DmlEvent;
 import io.debezium.connector.oracle.logminer.events.EventType;
 import io.debezium.connector.oracle.logminer.events.LogMinerEvent;
 import io.debezium.connector.oracle.logminer.events.LogMinerEventRow;
-import io.debezium.connector.oracle.logminer.events.TruncateEvent;
 import io.debezium.connector.oracle.logminer.parser.DmlParserException;
-import io.debezium.connector.oracle.logminer.parser.LogMinerDmlEntry;
-import io.debezium.connector.oracle.logminer.parser.LogMinerDmlEntryImpl;
 import io.debezium.connector.oracle.logminer.parser.LogMinerDmlParser;
 import io.debezium.jdbc.JdbcConfiguration;
+import io.debezium.relational.Table;
 import io.debezium.util.Strings;
 
 /**
@@ -196,7 +196,7 @@ public class LogMinerWorker implements Callable<WorkerResult> {
                         while (rs.next()) {
                             final LogMinerEventRow row = LogMinerEventRow.fromResultSet(rs, schema, connectorConfig);
                             processRow(row, cacheProvider, transactionFactory, dmlParser,
-                                    inheritedByTxId, resolved, orphans, schemaChanges);
+                                    resolved, orphans, schemaChanges);
                         }
                     }
                 }
@@ -230,7 +230,6 @@ public class LogMinerWorker implements Callable<WorkerResult> {
                             MemoryCacheProvider cacheProvider,
                             MemoryTransactionFactory transactionFactory,
                             LogMinerDmlParser dmlParser,
-                            Map<String, InheritedTransaction> inheritedByTxId,
                             List<CommittedTransaction> resolved,
                             List<OrphanCommit> orphans,
                             List<WorkerResult.SchemaChangeRecord> schemaChanges)
@@ -244,65 +243,98 @@ public class LogMinerWorker implements Callable<WorkerResult> {
             return;
         }
 
+        if (handleTransactionControlEvent(type, row, cacheProvider, transactionFactory, resolved, orphans)) {
+            return;
+        }
+
+        if (!handlePayloadEvent(type, row, cacheProvider, transactionFactory, dmlParser, schemaChanges)) {
+            // Skip LOB, XML, unsupported etc. ╬ô├ç├╢ workers produce raw events only
+            LOGGER.trace("Worker {} skipping event type {} at SCN {}", workerId, type, row.getScn());
+        }
+    }
+
+    private boolean handleTransactionControlEvent(EventType type,
+                                                  LogMinerEventRow row,
+                                                  MemoryCacheProvider cacheProvider,
+                                                  MemoryTransactionFactory transactionFactory,
+                                                  List<CommittedTransaction> resolved,
+                                                  List<OrphanCommit> orphans)
+            throws InterruptedException {
+
         switch (type) {
             case START -> {
-                final String txId = row.getTransactionId();
-                if (cacheProvider.getTransactionCache().getTransaction(txId) == null) {
-                    cacheProvider.getTransactionCache().addTransaction(transactionFactory.createTransaction(row));
-                }
-                else {
-                    cacheProvider.getTransactionCache().resetTransactionToStart(
-                            cacheProvider.getTransactionCache().getTransaction(txId));
-                }
+                LogMinerTransactionCacheHelper.startTransaction(cacheProvider.getTransactionCache(), transactionFactory, row);
+                return true;
             }
-            case COMMIT -> handleCommit(row, cacheProvider, inheritedByTxId, resolved, orphans);
+            case COMMIT -> {
+                handleCommit(row, cacheProvider, resolved, orphans);
+                return true;
+            }
             case ROLLBACK -> {
-                final MemoryTransaction tx = cacheProvider.getTransactionCache().getAndRemoveTransaction(row.getTransactionId());
-                if (tx != null) {
-                    cacheProvider.getTransactionCache().removeTransactionEvents(tx);
-                }
+                LogMinerTransactionCacheHelper.removeTransactionAndEvents(cacheProvider.getTransactionCache(), row.getTransactionId());
+                return true;
             }
-            case DDL -> {
-                if (row.getTableId() != null) {
-                    final WorkerResult.SchemaChangeRecord schemaChange = new WorkerResult.SchemaChangeRecord(
-                            row.getScn(),
-                            row.getTableId(),
-                            row.getRedoSql(),
-                            row.getChangeTime(),
-                            row.getThread(),
-                            row.getRsId(),
-                            row.getTransactionSequence(),
-                            row.getObjectId());
-                    if (schemaChangeListener != null) {
-                        schemaChangeListener.onSchemaChange(schemaChange);
-                    }
-                    else {
-                        schemaChanges.add(schemaChange);
-                    }
-                    // TRUNCATE TABLE arrives as a DDL event. In addition to applying the schema
-                    // change, we must record a TruncateEvent so the coordinator can dispatch it
-                    // as a data-change event when the change is merged at wave end.
-                    if (row.getRedoSql() != null
-                            && row.getRedoSql().trim().toUpperCase(java.util.Locale.ROOT).startsWith("TRUNCATE")) {
-                        final LogMinerDmlEntry entry = LogMinerDmlEntryImpl.forValuelessDdl();
-                        entry.setObjectName(row.getTableName());
-                        entry.setObjectOwner(row.getTablespaceName());
-                        MemoryTransaction tx = cacheProvider.getTransactionCache().getTransaction(row.getTransactionId());
-                        if (tx == null) {
-                            tx = transactionFactory.createTransaction(row);
-                            cacheProvider.getTransactionCache().addTransaction(tx);
-                        }
-                        final int eventId = tx.getNextEventId();
-                        cacheProvider.getTransactionCache().addTransactionEvent(tx, eventId, new TruncateEvent(row, entry));
-                    }
-                }
-            }
-            case INSERT, UPDATE, DELETE -> handleDml(row, cacheProvider, transactionFactory, dmlParser);
             default -> {
-                // Skip LOB, XML, unsupported etc. ╬ô├ç├╢ workers produce raw events only
-                LOGGER.trace("Worker {} skipping event type {} at SCN {}", workerId, type, row.getScn());
+                return false;
             }
         }
+    }
+
+    private boolean handlePayloadEvent(EventType type,
+                                       LogMinerEventRow row,
+                                       MemoryCacheProvider cacheProvider,
+                                       MemoryTransactionFactory transactionFactory,
+                                       LogMinerDmlParser dmlParser,
+                                       List<WorkerResult.SchemaChangeRecord> schemaChanges)
+            throws InterruptedException {
+
+        switch (type) {
+            case DDL -> {
+                handleDdl(row, cacheProvider, transactionFactory, schemaChanges);
+                return true;
+            }
+            case INSERT, UPDATE, DELETE -> {
+                handleDml(row, cacheProvider, transactionFactory, dmlParser);
+                return true;
+            }
+            default -> {
+                return false;
+            }
+        }
+    }
+
+    private void handleDdl(LogMinerEventRow row,
+                           MemoryCacheProvider cacheProvider,
+                           MemoryTransactionFactory transactionFactory,
+                           List<WorkerResult.SchemaChangeRecord> schemaChanges)
+            throws InterruptedException {
+
+        if (row.getTableId() == null) {
+            return;
+        }
+
+        emitSchemaChange(LogMinerEventFactory.createSchemaChangeRecord(row), schemaChanges);
+
+        final LogMinerEvent truncateEvent = LogMinerEventFactory.createTruncateEventIfDdl(row);
+        if (truncateEvent != null) {
+            LogMinerTransactionCacheHelper.enqueueTransactionEvent(
+                    cacheProvider.getTransactionCache(),
+                    transactionFactory,
+                    row,
+                    truncateEvent);
+        }
+    }
+
+    private void emitSchemaChange(WorkerResult.SchemaChangeRecord schemaChange,
+                                  List<WorkerResult.SchemaChangeRecord> schemaChanges)
+            throws InterruptedException {
+
+        if (schemaChangeListener != null) {
+            schemaChangeListener.onSchemaChange(schemaChange);
+            return;
+        }
+
+        schemaChanges.add(schemaChange);
     }
 
     private void handleDml(LogMinerEventRow row,
@@ -310,33 +342,25 @@ public class LogMinerWorker implements Callable<WorkerResult> {
                            MemoryTransactionFactory transactionFactory,
                            LogMinerDmlParser dmlParser) {
 
-        if (Strings.isNullOrBlank(row.getRedoSql())) {
-            return;
-        }
-        if (row.getTableId() == null) {
-            return;
-        }
-
-        final var table = schema.tableFor(row.getTableId());
+        final var table = getDmlEligibleTable(row);
         if (table == null) {
             return;
         }
 
         try {
-            final var dmlEntry = dmlParser.parse(row.getRedoSql(), table);
-            if (dmlEntry == null) {
+            final LogMinerEvent dataChangeEvent = LogMinerEventFactory.createDataChangeEvent(
+                    row,
+                    () -> dmlParser.parse(row.getRedoSql(), table),
+                    false);
+            if (dataChangeEvent == null) {
                 return;
             }
 
-            MemoryTransaction tx = cacheProvider.getTransactionCache().getTransaction(row.getTransactionId());
-            if (tx == null) {
-                tx = transactionFactory.createTransaction(row);
-                cacheProvider.getTransactionCache().addTransaction(tx);
-            }
-
-            final int eventId = tx.getNextEventId();
-            cacheProvider.getTransactionCache().addTransactionEvent(tx, eventId,
-                    new DmlEvent(row, dmlEntry));
+            LogMinerTransactionCacheHelper.enqueueTransactionEvent(
+                    cacheProvider.getTransactionCache(),
+                    transactionFactory,
+                    row,
+                    dataChangeEvent);
         }
         catch (DmlParserException e) {
             LOGGER.warn("Worker {} failed to parse DML at SCN {} for table {}: {}",
@@ -344,9 +368,20 @@ public class LogMinerWorker implements Callable<WorkerResult> {
         }
     }
 
+    private Table getDmlEligibleTable(LogMinerEventRow row) {
+        if (Strings.isNullOrBlank(row.getRedoSql())) {
+            return null;
+        }
+
+        if (row.getTableId() == null) {
+            return null;
+        }
+
+        return schema.tableFor(row.getTableId());
+    }
+
     private void handleCommit(LogMinerEventRow row,
                               MemoryCacheProvider cacheProvider,
-                              Map<String, InheritedTransaction> inheritedByTxId,
                               List<CommittedTransaction> resolved,
                               List<OrphanCommit> orphans)
             throws InterruptedException {
@@ -356,31 +391,19 @@ public class LogMinerWorker implements Callable<WorkerResult> {
 
         if (tx == null) {
             // We have no record of this transaction's START ╬ô├ç├╢ it is an orphan commit
-            orphans.add(new OrphanCommit(
-                    txId,
-                    row.getScn(),
-                    row.getChangeTime(),
-                    row.getThread(),
-                    unit.logFiles().stream()
-                            .map(LogFile::getFirstScn)
-                            .min(Comparator.naturalOrder())
-                            .orElse(row.getScn())));
+            orphans.add(createOrphanCommit(txId, row));
             return;
         }
 
         // Collect events from cache
-        final List<LogMinerEvent> events = new ArrayList<>();
+        final List<LogMinerEvent> events;
         try {
-            cacheProvider.getTransactionCache().forEachEvent(tx, (event, rolledBack) -> {
-                if (!rolledBack) {
-                    events.add(event);
-                }
-                return true;
-            });
+            events = LogMinerTransactionCacheHelper.getActiveTransactionEvents(cacheProvider.getTransactionCache(), tx);
         }
         catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             LOGGER.warn("Worker {} interrupted while collecting events for transaction {}", workerId, txId);
+            return;
         }
 
         cacheProvider.getTransactionCache().removeTransactionEvents(tx);
@@ -390,7 +413,7 @@ public class LogMinerWorker implements Callable<WorkerResult> {
         final String clientId = tx.getClientId();
         final int redoThreadId = tx.getRedoThreadId();
 
-        final CommittedTransaction committedTransaction = new CommittedTransaction(
+        emitCommittedTransaction(new CommittedTransaction(
                 txId,
                 tx.getStartScn(),
                 row.getScn(),
@@ -399,14 +422,30 @@ public class LogMinerWorker implements Callable<WorkerResult> {
                 clientId,
                 redoThreadId,
                 row.getRsId(),
-                List.copyOf(events));
+                List.copyOf(events)), resolved);
+    }
 
+    private OrphanCommit createOrphanCommit(String txId, LogMinerEventRow row) {
+        return new OrphanCommit(
+                txId,
+                row.getScn(),
+                row.getChangeTime(),
+                row.getThread(),
+                unit.logFiles().stream()
+                        .map(LogFile::getFirstScn)
+                        .min(Comparator.naturalOrder())
+                        .orElse(row.getScn()));
+    }
+
+    private void emitCommittedTransaction(CommittedTransaction committedTransaction,
+                                          List<CommittedTransaction> resolved)
+            throws InterruptedException {
         if (committedTransactionListener != null) {
             committedTransactionListener.onCommittedTransaction(committedTransaction);
+            return;
         }
-        else {
-            resolved.add(committedTransaction);
-        }
+
+        resolved.add(committedTransaction);
     }
 
     private List<InheritedTransaction> buildUnresolved(MemoryCacheProvider cacheProvider,
@@ -414,14 +453,9 @@ public class LogMinerWorker implements Callable<WorkerResult> {
         final List<InheritedTransaction> result = new ArrayList<>();
         cacheProvider.getTransactionCache().streamTransactionsAndReturn(stream -> {
             stream.forEach(tx -> {
-                final List<LogMinerEvent> events = new ArrayList<>();
+                final List<LogMinerEvent> events;
                 try {
-                    cacheProvider.getTransactionCache().forEachEvent(tx, (event, rolledBack) -> {
-                        if (!rolledBack) {
-                            events.add(event);
-                        }
-                        return true;
-                    });
+                    events = LogMinerTransactionCacheHelper.getActiveTransactionEvents(cacheProvider.getTransactionCache(), tx);
                 }
                 catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -450,27 +484,8 @@ public class LogMinerWorker implements Callable<WorkerResult> {
 
     private OracleConnection createConnection() throws SQLException {
         final OracleConnection connection = new OracleConnection(jdbcConfig, false);
-        prepareMiningSession(connection);
+        LogMinerSessionHelper.configureSession(connection, connectorConfig, LOGGER);
         return connection;
-    }
-
-    private void prepareMiningSession(OracleConnection connection) throws SQLException {
-        connection.executeWithoutCommitting("ALTER SESSION SET"
-                + "  NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS'"
-                + "  NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF9'"
-                + "  NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF9 TZH:TZM'"
-                + "  NLS_NUMERIC_CHARACTERS = '.,'");
-        connection.executeWithoutCommitting("ALTER SESSION SET TIME_ZONE = '00:00'");
-
-        final long hashAreaSize = connectorConfig.getLogMiningHashAreaSize();
-        if (hashAreaSize > 0) {
-            connection.executeWithoutCommitting("ALTER SESSION SET HASH_AREA_SIZE = " + hashAreaSize);
-        }
-
-        final long sortAreaSize = connectorConfig.getLogMiningSortAreaSize();
-        if (sortAreaSize > 0) {
-            connection.executeWithoutCommitting("ALTER SESSION SET SORT_AREA_SIZE = " + sortAreaSize);
-        }
     }
 
 }

@@ -34,7 +34,9 @@ import io.debezium.connector.oracle.Scn;
 import io.debezium.connector.oracle.logminer.AbstractLogMinerStreamingChangeEventSource;
 import io.debezium.connector.oracle.logminer.LogFile;
 import io.debezium.connector.oracle.logminer.LogMinerEventDispatchHelper;
+import io.debezium.connector.oracle.logminer.LogMinerEventFactory;
 import io.debezium.connector.oracle.logminer.LogMinerStreamingChangeEventSourceMetrics;
+import io.debezium.connector.oracle.logminer.LogMinerTransactionCacheHelper;
 import io.debezium.connector.oracle.logminer.SqlUtils;
 import io.debezium.connector.oracle.logminer.TransactionCommitConsumer;
 import io.debezium.connector.oracle.logminer.buffered.ehcache.EhcacheCacheProvider;
@@ -48,7 +50,6 @@ import io.debezium.connector.oracle.logminer.events.DmlEvent;
 import io.debezium.connector.oracle.logminer.events.EventType;
 import io.debezium.connector.oracle.logminer.events.LogMinerEvent;
 import io.debezium.connector.oracle.logminer.events.LogMinerEventRow;
-import io.debezium.connector.oracle.logminer.events.TruncateEvent;
 import io.debezium.connector.oracle.logminer.logwriter.LogWriterFlushStrategy;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
@@ -363,14 +364,15 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
     protected void handleStartEvent(LogMinerEventRow event) {
         final String transactionId = event.getTransactionId();
         if (!isRecentlyProcessed(transactionId)) {
-            final Transaction transaction = getTransactionCache().getTransaction(transactionId);
-            if (transaction == null) {
-                getTransactionCache().addTransaction(transactionFactory.createTransaction(event));
+            final LogMinerTransactionCacheHelper.StartResult<Transaction> startResult = LogMinerTransactionCacheHelper.startTransaction(
+                    getTransactionCache(),
+                    transactionFactory,
+                    event);
+            if (startResult.created()) {
                 getMetrics().setActiveTransactionCount(getTransactionCache().getTransactionCount());
             }
             else {
                 LOGGER.trace("Transaction {} is not yet committed and START event detected.", transactionId);
-                getTransactionCache().resetTransactionToStart(transaction);
             }
         }
     }
@@ -540,9 +542,7 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
                         transactionId, prefix);
 
                 // Collect all matching transactions to determine if we can safely identify a single one
-                final List<Transaction> matchingTransactions = getTransactionCache().streamTransactionsAndReturn(
-                        stream -> stream.filter(t -> t.getTransactionId().startsWith(prefix))
-                                .toList());
+                final List<Transaction> matchingTransactions = LogMinerTransactionCacheHelper.findTransactionsByPrefix(getTransactionCache(), prefix);
 
                 if (matchingTransactions.isEmpty()) {
                     LOGGER.debug("No matching transaction found in cache for partial transaction '{}' with prefix '{}'",
@@ -618,7 +618,7 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
             final Table table = getTableForDataEvent(event);
             if (table != null) {
                 LOGGER.debug("Dispatching TRUNCATE event for table '{}' with SCN {}", table.id(), event.getScn());
-                enqueueEvent(event, new TruncateEvent(event, parseTruncateEvent(event)));
+                enqueueEvent(event, LogMinerEventFactory.createTruncateEvent(event));
             }
         }
         catch (SQLException e) {
@@ -648,11 +648,9 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
         // done by Oracle, we should automatically discard the transaction from the buffer to avoid the low
         // watermark from advancing safely.
         final String transactionId = event.getTransactionId();
-        final Transaction transaction = getTransactionCache().getTransaction(transactionId);
+        final Transaction transaction = LogMinerTransactionCacheHelper.removeTransactionAndEvents(getTransactionCache(), transactionId);
         if (transaction != null) {
             LOGGER.debug("Skipping GoldenGate replication marker for transaction {} with SCN {}", transactionId, event.getScn());
-            getTransactionCache().removeTransactionEvents(transaction);
-            getTransactionCache().removeTransaction(transaction);
         }
         // It should not exist in this cache, but in case.
         getTransactionCache().removeAbandonedTransaction(transactionId);
@@ -965,11 +963,7 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
      */
     private void finalizeTransaction(String transactionId, Scn eventScn, boolean rollbackEvent) {
         if (rollbackEvent) {
-            final Transaction transaction = getTransactionCache().getTransaction(transactionId);
-            if (transaction != null) {
-                getTransactionCache().removeTransactionEvents(transaction);
-                getTransactionCache().removeTransaction(transaction);
-            }
+            LogMinerTransactionCacheHelper.removeTransactionAndEvents(getTransactionCache(), transactionId);
         }
 
         getTransactionCache().removeAbandonedTransaction(transactionId);
@@ -1001,29 +995,23 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
 
     @Override
     protected void enqueueEvent(LogMinerEventRow event, LogMinerEvent dispatchedEvent) throws InterruptedException {
-        final String transactionId = event.getTransactionId();
-
-        Transaction transaction = getTransactionCache().getTransaction(transactionId);
-        if (transaction == null) {
-            LOGGER.trace("Transaction {} is not in cache, creating.", transactionId);
-            transaction = transactionFactory.createTransaction(event);
-            getTransactionCache().addTransaction(transaction);
-
+        final LogMinerTransactionCacheHelper.EnqueueResult<Transaction> enqueueResult = LogMinerTransactionCacheHelper.enqueueTransactionEvent(
+                getTransactionCache(),
+                transactionFactory,
+                event,
+                dispatchedEvent);
+        if (enqueueResult.created()) {
+            LOGGER.trace("Transaction {} is not in cache, creating.", event.getTransactionId());
             getMetrics().setActiveTransactionCount(getTransactionCache().getTransactionCount());
         }
 
-        final int eventId = transaction.getNextEventId();
-        if (!getTransactionCache().containsTransactionEvent(transaction, eventId)) {
-            // Add new event at eventId offset
-            LOGGER.trace("Transaction {}, adding event reference at key {}", transactionId, transaction.getEventId(eventId));
-            getTransactionCache().addTransactionEvent(transaction, eventId, dispatchedEvent);
+        if (enqueueResult.added()) {
+            LOGGER.trace("Transaction {}, adding event reference at key {}",
+                    event.getTransactionId(), enqueueResult.transaction().getEventId(enqueueResult.eventId()));
             getMetrics().calculateLagFromSource(event.getChangeTime());
 
             getMetrics().setBufferedEventCount(getTransactionCache().getTransactionEvents());
         }
-
-        // When using Infinispan, this extra put is required so that the state is properly synchronized
-        getTransactionCache().syncTransaction(transaction);
     }
 
     /**
@@ -1137,12 +1125,8 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
     private String getLoggedAbandonedTransactionTableNames(Transaction transaction) throws InterruptedException {
         if (ABANDONED_DETAILS_LOGGER.isDebugEnabled()) {
             final Set<String> tableNames = new HashSet<>();
-            getTransactionCache().forEachEvent(transaction, (event, rolledBack) -> {
-                if (!rolledBack) {
-                    tableNames.add(event.getTableId().identifier());
-                }
-                return true;
-            });
+            LogMinerTransactionCacheHelper.forEachActiveTransactionEvent(getTransactionCache(), transaction,
+                    event -> tableNames.add(event.getTableId().identifier()));
             return String.format(", %d tables [%s]", tableNames.size(), String.join(",", tableNames));
         }
         return "";

@@ -29,6 +29,7 @@ import io.debezium.connector.oracle.OraclePartition;
 import io.debezium.connector.oracle.Scn;
 import io.debezium.connector.oracle.logminer.AbstractLogMinerStreamingChangeEventSource;
 import io.debezium.connector.oracle.logminer.LogMinerChangeRecordEmitter;
+import io.debezium.connector.oracle.logminer.LogMinerEventFactory;
 import io.debezium.connector.oracle.logminer.LogMinerStreamingChangeEventSourceMetrics;
 import io.debezium.connector.oracle.logminer.TransactionCommitConsumer;
 import io.debezium.connector.oracle.logminer.events.DmlEvent;
@@ -36,7 +37,7 @@ import io.debezium.connector.oracle.logminer.events.EventType;
 import io.debezium.connector.oracle.logminer.events.LogMinerEvent;
 import io.debezium.connector.oracle.logminer.events.LogMinerEventRow;
 import io.debezium.connector.oracle.logminer.events.RedoSqlDmlEvent;
-import io.debezium.connector.oracle.logminer.parser.LogMinerDmlEntry;
+import io.debezium.connector.oracle.logminer.events.TruncateEvent;
 import io.debezium.data.Envelope;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
@@ -470,7 +471,7 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
             if (table != null) {
                 LOGGER.debug("Dispatching TRUNCATE event for table '{}' with SCN {}", table.id(), event.getScn());
 
-                final LogMinerDmlEntry parsedEvent = parseTruncateEvent(event);
+                final TruncateEvent truncateEvent = LogMinerEventFactory.createTruncateEvent(event);
 
                 // Truncate events are wrapped in START/COMMIT markers
                 getOffsetContext().getCommitScn().recordCommit(event);
@@ -494,8 +495,8 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
                                 getPartition(),
                                 getOffsetContext(),
                                 Envelope.Operation.TRUNCATE,
-                                parsedEvent.getOldValues(),
-                                parsedEvent.getNewValues(),
+                                truncateEvent.getOldValues(),
+                                truncateEvent.getNewValues(),
                                 table,
                                 getSchema(),
                                 getClock()));
