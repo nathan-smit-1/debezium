@@ -116,8 +116,8 @@ public final class LogMinerEventDispatchHelper {
     }
 
     public static boolean isSchemaChangeSkippedByTableFilter(OracleConnectorConfig connectorConfig,
-                                                              OracleDatabaseSchema schema,
-                                                              TableId tableId) {
+                                                             OracleDatabaseSchema schema,
+                                                             TableId tableId) {
         if (tableId != null && schema.storeOnlyCapturedTables()
                 && !connectorConfig.getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
             LOGGER.debug("Skipped DDL associated with table '{}' because schema history only stores included tables.", tableId);

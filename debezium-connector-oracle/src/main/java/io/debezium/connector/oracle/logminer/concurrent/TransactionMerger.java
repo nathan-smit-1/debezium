@@ -344,8 +344,8 @@ final class TransactionMerger {
     }
 
     private List<CommittedTransaction> filterResolvedTransactions(WorkerResult result,
-                                                                   List<WorkUnitPlanner.KnownCommitContinuationPlan> continuationPlans,
-                                                                   Set<Integer> overlappingWorkerIds) {
+                                                                  List<WorkUnitPlanner.KnownCommitContinuationPlan> continuationPlans,
+                                                                  Set<Integer> overlappingWorkerIds) {
         if (result.unitType() != WorkUnitType.WORKER || !overlappingWorkerIds.contains(result.workerId())) {
             return result.resolvedTransactions();
         }
@@ -370,8 +370,8 @@ final class TransactionMerger {
     }
 
     private List<LogMinerSchemaChangeRecord> filterSchemaChanges(WorkerResult result,
-                                                                       List<WorkUnitPlanner.KnownCommitContinuationPlan> continuationPlans,
-                                                                       Set<Integer> overlappingWorkerIds) {
+                                                                 List<WorkUnitPlanner.KnownCommitContinuationPlan> continuationPlans,
+                                                                 Set<Integer> overlappingWorkerIds) {
         if (result.unitType() != WorkUnitType.WORKER || !overlappingWorkerIds.contains(result.workerId())) {
             return result.schemaChanges();
         }
@@ -396,13 +396,13 @@ final class TransactionMerger {
     }
 
     private boolean isRecoverableByKnownCommitContinuation(CommittedTransaction transaction,
-                                                            List<WorkUnitPlanner.KnownCommitContinuationPlan> plans) {
+                                                           List<WorkUnitPlanner.KnownCommitContinuationPlan> plans) {
         return plans.stream().anyMatch(plan -> transaction.commitScn().compareTo(plan.unsafeIntervalStartScn()) > 0
                 && transaction.commitScn().compareTo(plan.unsafeIntervalEndScn()) <= 0);
     }
 
     private boolean isRecoverableByKnownCommitContinuation(LogMinerSchemaChangeRecord change,
-                                                            List<WorkUnitPlanner.KnownCommitContinuationPlan> plans) {
+                                                           List<WorkUnitPlanner.KnownCommitContinuationPlan> plans) {
         return plans.stream().anyMatch(plan -> change.scn().compareTo(plan.unsafeIntervalStartScn()) > 0
                 && change.scn().compareTo(plan.unsafeIntervalEndScn()) <= 0);
     }
@@ -423,13 +423,13 @@ final class TransactionMerger {
     }
 
     private void dispatchTransactionsWithSchemaChanges(List<CommittedTransaction> transactions,
-                                                        List<LogMinerSchemaChangeRecord> schemaChanges,
-                                                        EventDispatcher<OraclePartition, TableId> dispatcher,
-                                                        OraclePartition partition,
-                                                        OracleOffsetContext offsetContext,
-                                                        ZoneOffset databaseOffset,
-                                                        Scn safeHorizon,
-                                                        List<LogMinerSchemaChangeRecord> appliedSchemaChanges)
+                                                       List<LogMinerSchemaChangeRecord> schemaChanges,
+                                                       EventDispatcher<OraclePartition, TableId> dispatcher,
+                                                       OraclePartition partition,
+                                                       OracleOffsetContext offsetContext,
+                                                       ZoneOffset databaseOffset,
+                                                       Scn safeHorizon,
+                                                       List<LogMinerSchemaChangeRecord> appliedSchemaChanges)
             throws InterruptedException {
 
         final Iterator<LogMinerSchemaChangeRecord> schemaIter = schemaChanges.iterator();
@@ -487,8 +487,8 @@ final class TransactionMerger {
     }
 
     private void scheduleContaminatedTransactionReplay(List<LogFile> availableLogs,
-                                                        List<CommittedTransaction> contaminated,
-                                                        List<LogMinerSchemaChangeRecord> schemaChanges) {
+                                                       List<CommittedTransaction> contaminated,
+                                                       List<LogMinerSchemaChangeRecord> schemaChanges) {
         final Map<TableId, Scn> earliestDdlScnByTable = new HashMap<>();
         for (final LogMinerSchemaChangeRecord ddl : schemaChanges) {
             if (ddl.tableId() != null) {

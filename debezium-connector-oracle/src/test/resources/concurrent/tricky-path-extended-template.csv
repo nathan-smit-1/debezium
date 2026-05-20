@@ -1,0 +1,94 @@
+# LogMiner Event Simulation Template
+#
+# This CSV defines simulated LogMiner events for testing concurrent Oracle LogMiner reads.
+# Each row represents one event from v$logmnr_contents.
+#
+# The SQLite-based test framework loads this CSV into an in-memory database, creating one
+# table per log file. A CTE (Common Table Expression) unions the relevant log tables to
+# simulate a LogMiner session, and the SELECT query with the SCN range simulates the read.
+#
+# Column descriptions:
+# - log_name:         Identifier for the log file (e.g., a_log1, redo01)
+# - log_type:         ARCHIVE or REDO
+# - log_first_scn:    First SCN covered by this log
+# - log_next_scn:     Next SCN (exclusive upper bound) of this log
+# - scn:              Event SCN
+# - operation_code:   Numeric LogMiner operation code:
+#                       1=INSERT, 2=DELETE, 3=UPDATE, 5=DDL,
+#                       6=START, 7=COMMIT, 36=ROLLBACK
+# - operation:        Textual operation name
+# - transaction_id:   Hex transaction ID
+# - start_scn:        Transaction start SCN (populated for COMMIT rows)
+# - commit_scn:       Transaction commit SCN (populated for COMMIT rows)
+# - timestamp:        Event timestamp (YYYY-MM-DD HH:MM:SS)
+# - table_name:       Table name (for DML/DDL)
+# - seg_owner:        Schema/owner (for DML/DDL)
+# - sql_redo:         SQL redo statement
+# - username:         Database user
+# - rs_id:            Rollback segment ID
+# - thread:           Redo thread number
+# - client_id:        Client ID
+# - csf:              Continuation SQL flag (0 or 1)
+# - rollback_flag:    Rollback flag (0 or 1)
+# - status:           Status code (0=normal, 2=error)
+# - info:             Info text
+# - ssn:              SQL sequence number
+# - row_id:           Row ID
+# - sequence:         Transaction sequence number
+# - data_obj:         Data object ID
+# - data_objv:        Data object version
+# - data_objd:        Data object data ID
+#
+# ------------------------------------------------------------------------------
+# Test case: happy_path_with_6_log_bridge
+# Description: Six archive logs with one massive cross-log transaction spanning from log1 to log6.
+#
+# Log layout:
+#   a_log1: first_scn=1,  next_scn=10  (covers SCN 1 through 9)
+#   a_log2: first_scn=10, next_scn=20  (covers SCN 10 through 19)
+#   a_log3: first_scn=20, next_scn=30  (covers SCN 20 through 29)
+#   a_log4: first_scn=30, next_scn=40  (covers SCN 30 through 39)
+#   a_log5: first_scn=40, next_scn=50  (covers SCN 40 through 49)
+#   a_log6: first_scn=50, next_scn=60  (covers SCN 50 through 59)
+#
+# Transaction layout:
+#   10001: START=2, COMMIT=55                (START in a_log1, COMMIT in a_log6 -> 6-log BRIDGE)
+#   10002: START=3, UPDATE=4, COMMIT=5       (fully in a_log1)
+#   10003: START=12, UPDATE=13, COMMIT=15    (fully in a_log2)
+#   10004: START=22, UPDATE=23, COMMIT=25    (fully in a_log3)
+#   10005: START=32, UPDATE=33, COMMIT=35    (fully in a_log4)
+#   10006: START=42, UPDATE=43, COMMIT=45    (fully in a_log5)
+#   10007: START=52, UPDATE=53, COMMIT=58    (fully in a_log6)
+#
+# Expected behavior with 6 concurrent readers:
+#   - Worker 0 (a_log1): Resolves 10002, Inherits 10001 START.
+#   - Worker 1 (a_log2): Resolves 10003.
+#   - Worker 2 (a_log3): Resolves 10004.
+#   - Worker 3 (a_log4): Resolves 10005.
+#   - Worker 4 (a_log5): Resolves 10006.
+#   - Worker 5 (a_log6): Resolves 10007, Orphans 10001 COMMIT.
+#   - Bridge unit reads a_log1 -> a_log6: Resolves 10001 (inherited START + orphan COMMIT).
+#   - Total dispatched: 7 transactions
+# ------------------------------------------------------------------------------
+
+log_name,log_type,log_first_scn,log_next_scn,scn,operation_code,operation,transaction_id,start_scn,commit_scn,timestamp,table_name,seg_owner,sql_redo,username,rs_id,thread,client_id,csf,rollback_flag,status,info,ssn,row_id,sequence,data_obj,data_objv,data_objd
+a_log1,ARCHIVE,1,10,2,6,START,10001,,,2025-01-01 00:00:00,,,,USER,0x000001.00000001.0010,1,,0,0,0,,0,,0,0,0,0
+a_log1,ARCHIVE,1,10,3,6,START,10002,,,2025-01-01 00:00:01,,,,USER,0x000001.00000002.0010,1,,0,0,0,,0,,0,0,0,0
+a_log1,ARCHIVE,1,10,4,3,UPDATE,10002,,,2025-01-01 00:00:02,TEST_TABLE,TEST_SCHEMA,"update ""TEST_TABLE"" set ""C1"" = 'x' where ""C1"" = 'y';",USER,0x000001.00000003.0010,1,,0,0,0,,0,AAAAAAAAAAAAAAAAAA,0,0,0,0
+a_log1,ARCHIVE,1,10,5,7,COMMIT,10002,3,5,2025-01-01 00:00:03,,,,USER,0x000001.00000004.0010,1,,0,0,0,,0,,0,0,0,0
+a_log2,ARCHIVE,10,20,12,6,START,10003,,,2025-01-01 00:00:04,,,,USER,0x000002.00000005.0010,1,,0,0,0,,0,,0,0,0,0
+a_log2,ARCHIVE,10,20,13,3,UPDATE,10003,,,2025-01-01 00:00:05,TEST_TABLE,TEST_SCHEMA,"update ""TEST_TABLE"" set ""C1"" = 'a' where ""C1"" = 'b';",USER,0x000002.00000006.0010,1,,0,0,0,,0,AAABAAAAAAAAAAAAAA,0,0,0,0
+a_log2,ARCHIVE,10,20,15,7,COMMIT,10003,12,15,2025-01-01 00:00:06,,,,USER,0x000002.00000007.0010,1,,0,0,0,,0,,0,0,0,0
+a_log3,ARCHIVE,20,30,22,6,START,10004,,,2025-01-01 00:00:07,,,,USER,0x000003.00000008.0010,1,,0,0,0,,0,,0,0,0,0
+a_log3,ARCHIVE,20,30,23,3,UPDATE,10004,,,2025-01-01 00:00:08,TEST_TABLE,TEST_SCHEMA,"update ""TEST_TABLE"" set ""C1"" = 'c' where ""C1"" = 'd';",USER,0x000003.00000009.0010,1,,0,0,0,,0,AAACAAAAAAAAAAAAAA,0,0,0,0
+a_log3,ARCHIVE,20,30,25,7,COMMIT,10004,22,25,2025-01-01 00:00:09,,,,USER,0x000003.00000010.0010,1,,0,0,0,,0,,0,0,0,0
+a_log4,ARCHIVE,30,40,32,6,START,10005,,,2025-01-01 00:00:10,,,,USER,0x000004.00000011.0010,1,,0,0,0,,0,,0,0,0,0
+a_log4,ARCHIVE,30,40,33,3,UPDATE,10005,,,2025-01-01 00:00:11,TEST_TABLE,TEST_SCHEMA,"update ""TEST_TABLE"" set ""C1"" = 'e' where ""C1"" = 'f';",USER,0x000004.00000012.0010,1,,0,0,0,,0,AAADAAAAAAAAAAAAAA,0,0,0,0
+a_log4,ARCHIVE,30,40,35,7,COMMIT,10005,32,35,2025-01-01 00:00:12,,,,USER,0x000004.00000013.0010,1,,0,0,0,,0,,0,0,0,0
+a_log5,ARCHIVE,40,50,42,6,START,10006,,,2025-01-01 00:00:13,,,,USER,0x000005.00000014.0010,1,,0,0,0,,0,,0,0,0,0
+a_log5,ARCHIVE,40,50,43,3,UPDATE,10006,,,2025-01-01 00:00:14,TEST_TABLE,TEST_SCHEMA,"update ""TEST_TABLE"" set ""C1"" = 'g' where ""C1"" = 'h';",USER,0x000005.00000015.0010,1,,0,0,0,,0,AAAEAAAAAAAAAAAAAA,0,0,0,0
+a_log5,ARCHIVE,40,50,45,7,COMMIT,10006,42,45,2025-01-01 00:00:15,,,,USER,0x000005.00000016.0010,1,,0,0,0,,0,,0,0,0,0
+a_log6,ARCHIVE,50,60,52,6,START,10007,,,2025-01-01 00:00:16,,,,USER,0x000006.00000017.0010,1,,0,0,0,,0,,0,0,0,0
+a_log6,ARCHIVE,50,60,53,3,UPDATE,10007,,,2025-01-01 00:00:17,TEST_TABLE,TEST_SCHEMA,"update ""TEST_TABLE"" set ""C1"" = 'i' where ""C1"" = 'j';",USER,0x000006.00000018.0010,1,,0,0,0,,0,AAAGAAAAAAAAAAAAAA,0,0,0,0
+a_log6,ARCHIVE,50,60,55,7,COMMIT,10001,2,55,2025-01-01 00:00:18,,,,USER,0x000001.00000001.0010,1,,0,0,0,,0,,0,0,0,0
+a_log6,ARCHIVE,50,60,58,7,COMMIT,10007,52,58,2025-01-01 00:00:19,,,,USER,0x000006.00000019.0010,1,,0,0,0,,0,,0,0,0,0

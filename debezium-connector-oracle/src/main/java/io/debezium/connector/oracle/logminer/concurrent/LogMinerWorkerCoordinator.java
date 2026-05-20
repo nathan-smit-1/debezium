@@ -150,7 +150,7 @@ public class LogMinerWorkerCoordinator implements AutoCloseable {
             t.setDaemon(true);
             return t;
         });
-        this.planner = new WorkUnitPlanner(concurrentReaders);
+        this.planner = new WorkUnitPlanner(concurrentReaders, connectorConfig.getLogMiningMinimumLogCount());
         this.merger = new TransactionMerger(connectorConfig, schema, streamingMetrics,
                 pendingInheritedTransactions, pendingOrphanCommits, pendingReplayUnits,
                 pendingDispatch, pendingSchemaChanges, pendingDdlContaminationUnits,
@@ -168,11 +168,6 @@ public class LogMinerWorkerCoordinator implements AutoCloseable {
      * @return {@code true} if concurrent reading should be used
      */
     public boolean isConcurrentReadingApplicable(List<LogFile> logs) {
-        final boolean anyRedoLog = logs.stream().anyMatch(LogFile::isRedo);
-        if (anyRedoLog) {
-            LOGGER.debug("Concurrent reading skipped: online redo log(s) in scope.");
-            return false;
-        }
         final long archiveCount = logs.stream().filter(LogFile::isArchive).count();
         if (archiveCount < 2) {
             LOGGER.debug("Concurrent reading skipped: only {} archive log(s) in scope.", archiveCount);
@@ -412,7 +407,6 @@ public class LogMinerWorkerCoordinator implements AutoCloseable {
                 .orElse(Scn.NULL);
         return executeSerial(defaultReadStartScn, defaultReadEndScn, allLogs, dispatcher, partition, offsetContext, databaseOffset);
     }
-
 
     private static String describeScnSpan(Scn startScn, Scn endScn) {
         if (startScn.isNull() || endScn.isNull()) {
@@ -739,8 +733,6 @@ public class LogMinerWorkerCoordinator implements AutoCloseable {
 
     // ------------------------------------------------------------------ private helpers
 
-
-
     private String describeResults(List<WorkerResult> results) {
         return results.stream()
                 .map(result -> "worker=" + result.workerId()
@@ -753,6 +745,5 @@ public class LogMinerWorkerCoordinator implements AutoCloseable {
                 .toList()
                 .toString();
     }
-
 
 }

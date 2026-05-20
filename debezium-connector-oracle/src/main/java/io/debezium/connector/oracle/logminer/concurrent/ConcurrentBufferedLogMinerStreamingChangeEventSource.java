@@ -113,10 +113,15 @@ public class ConcurrentBufferedLogMinerStreamingChangeEventSource
             final Scn finalUpperBound = boundedWindow.finalUpperBoundScn();
             final List<LogFile> allLogs = boundedWindow.logFiles();
 
-            LOGGER.info("Concurrent LogMiner wave {} prepared: readScn={}, upperBound={}, finalUpperBound={}, logs={}",
-                    waveNumber, currentReadScn, upperBound, finalUpperBound, describeLogs(allLogs));
+            // The session selector (e.g. CappedLogFileSessionSelector) may cap the logs that
+            // are added to the LogMiner session. Serial fallback must use the same capped set
+            // so that it reverts to the old single-threaded behaviour exactly.
+            final List<LogFile> sessionLogs = getSessionLogFiles() != null ? getSessionLogFiles() : allLogs;
 
-            if (allLogs == null || allLogs.isEmpty()) {
+            LOGGER.info("Concurrent LogMiner wave {} prepared: readScn={}, upperBound={}, finalUpperBound={}, sessionLogs={}",
+                    waveNumber, currentReadScn, upperBound, finalUpperBound, describeLogs(sessionLogs));
+
+            if (sessionLogs == null || sessionLogs.isEmpty()) {
                 LOGGER.debug("No logs available in range [{}, {}]; pausing.", currentReadScn, finalUpperBound);
                 pauseBetweenMiningSessions();
                 dataDispatchedInCurrentWave = false;
@@ -130,7 +135,7 @@ public class ConcurrentBufferedLogMinerStreamingChangeEventSource
             // must be mined serially because they are still being written to.
             final List<LogFile> archiveLogs = new ArrayList<>();
             final List<LogFile> redoLogs = new ArrayList<>();
-            for (LogFile log : allLogs) {
+            for (LogFile log : sessionLogs) {
                 if (log.isArchive()) {
                     archiveLogs.add(log);
                 }
@@ -211,14 +216,14 @@ public class ConcurrentBufferedLogMinerStreamingChangeEventSource
                     LOGGER.info(
                             "Concurrent LogMiner wave {} executing serial continuation over logs {} because inherited transactions {} still have unknown commit locations",
                             waveNumber,
-                            describeLogs(allLogs),
+                            describeLogs(sessionLogs),
                             coordinator.getPendingInheritedTransactions().stream()
                                     .map(InheritedTransaction::transactionId)
                                     .toList());
                     final Scn serialProcessedScn = executeBoundedSerial(
                             currentReadScn,
                             finalUpperBound,
-                            allLogs,
+                            sessionLogs,
                             databaseOffset);
                     if (!serialProcessedScn.isNull()) {
                         currentReadScn = serialProcessedScn;
@@ -261,19 +266,19 @@ public class ConcurrentBufferedLogMinerStreamingChangeEventSource
                     LOGGER.info(
                             "Concurrent LogMiner wave {} falling back to serial mode over logs {} because inherited transactions {} still have unknown commit locations",
                             waveNumber,
-                            describeLogs(allLogs),
+                            describeLogs(sessionLogs),
                             coordinator.getPendingInheritedTransactions().stream()
                                     .map(InheritedTransaction::transactionId)
                                     .toList());
                 }
                 else {
                     LOGGER.info("Concurrent LogMiner wave {} falling back to serial mode over logs {}",
-                            waveNumber, describeLogs(allLogs));
+                            waveNumber, describeLogs(sessionLogs));
                 }
                 final Scn processedScn = executeBoundedSerial(
                         currentReadScn,
                         finalUpperBound,
-                        allLogs,
+                        sessionLogs,
                         databaseOffset);
                 if (!processedScn.isNull()) {
                     currentReadScn = processedScn;

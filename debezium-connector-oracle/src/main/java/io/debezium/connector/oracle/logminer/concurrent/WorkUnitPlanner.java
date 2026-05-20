@@ -35,9 +35,11 @@ final class WorkUnitPlanner {
     private static final Logger LOGGER = LoggerFactory.getLogger(WorkUnitPlanner.class);
 
     private final int concurrentReaders;
+    private final int minimumLogCount;
 
-    WorkUnitPlanner(int concurrentReaders) {
+    WorkUnitPlanner(int concurrentReaders, int minimumLogCount) {
         this.concurrentReaders = concurrentReaders;
+        this.minimumLogCount = minimumLogCount;
     }
 
     // ------------------------------------------------------------------ top-level planning
@@ -122,8 +124,8 @@ final class WorkUnitPlanner {
     // ------------------------------------------------------------------ known-commit continuation planning
 
     List<KnownCommitContinuationPlan> planKnownCommitContinuations(List<LogFile> sortedLogs,
-                                                                    List<InheritedTransaction> pendingInheritedTransactions,
-                                                                    List<OrphanCommit> pendingOrphanCommits) {
+                                                                   List<InheritedTransaction> pendingInheritedTransactions,
+                                                                   List<OrphanCommit> pendingOrphanCommits) {
         final List<KnownCommitContinuationPlan> plans = new ArrayList<>();
 
         for (OrphanCommit orphan : pendingOrphanCommits) {
@@ -162,7 +164,7 @@ final class WorkUnitPlanner {
     }
 
     List<KnownCommitContinuationPlan> planKnownCommitContinuations(List<InheritedTransaction> pendingInheritedTransactions,
-                                                                    List<OrphanCommit> pendingOrphanCommits) {
+                                                                   List<OrphanCommit> pendingOrphanCommits) {
         final List<KnownCommitContinuationPlan> plans = new ArrayList<>();
 
         for (OrphanCommit orphan : pendingOrphanCommits) {
@@ -189,7 +191,7 @@ final class WorkUnitPlanner {
     // ------------------------------------------------------------------ overlap and replay planning
 
     List<WorkerResult> findOverlappingWorkerResults(List<WorkerResult> results,
-                                                     List<KnownCommitContinuationPlan> continuationPlans) {
+                                                    List<KnownCommitContinuationPlan> continuationPlans) {
         if (results.isEmpty() || continuationPlans.isEmpty()) {
             return List.of();
         }
@@ -296,15 +298,18 @@ final class WorkUnitPlanner {
     // ------------------------------------------------------------------ worker unit construction
 
     /**
-     * Distributes the worker logs contiguously across {@code concurrentReaders} work units.
+     * Distributes the worker logs contiguously across {@code concurrentReaders} work units,
+     * capping each worker to at most {@code minimumLogCount} logs when the cap is enabled
+     * ({@code > 0}). Leftover logs are left unassigned and processed in a subsequent wave.
      */
     List<WorkUnit> buildWorkerUnits(List<LogFile> workerLogs, Scn readStartScn) {
         final List<WorkUnit> units = new ArrayList<>();
         final int readers = Math.min(concurrentReaders, workerLogs.size());
-        final int chunkSize = workerLogs.size() / readers;
+        final int maxLogsPerWorker = minimumLogCount > 0 ? minimumLogCount : Integer.MAX_VALUE;
+        final int chunkSize = Math.min(maxLogsPerWorker, workerLogs.size() / readers);
         final int remainder = workerLogs.size() % readers;
         int start = 0;
-        for (int i = 0; i < readers; i++) {
+        for (int i = 0; i < readers && start < workerLogs.size(); i++) {
             final int endExclusive = start + chunkSize + (i < remainder ? 1 : 0);
             final List<LogFile> partition = new ArrayList<>(workerLogs.subList(start, endExclusive));
             start = endExclusive;
