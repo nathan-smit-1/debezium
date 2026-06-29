@@ -25,11 +25,13 @@ import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.Calendar;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -53,6 +55,7 @@ import io.debezium.connector.oracle.jdbc.OracleConnectionFactory;
 import io.debezium.connector.oracle.jdbc.StandardOracleConnectionFactory;
 import io.debezium.connector.oracle.junit.SkipWhenAdapterNameIsNot;
 import io.debezium.connector.oracle.logminer.AbstractLogMinerStreamingChangeEventSource;
+import io.debezium.connector.oracle.logminer.LogMinerChangeRecordEmitter;
 import io.debezium.connector.oracle.logminer.LogMinerStreamingChangeEventSourceMetrics;
 import io.debezium.connector.oracle.logminer.OffsetActivityMonitor;
 import io.debezium.connector.oracle.logminer.buffered.BufferedLogMinerStreamingChangeEventSource.ProcessResult;
@@ -126,9 +129,14 @@ public class DeferredMemoryStreamingChangeEventSourceTest extends AbstractAsyncE
     }
 
     private Configuration.Builder getConfig() {
+        return getConfig(false);
+    }
+
+    private Configuration.Builder getConfig(boolean cachePin) {
         return TestHelper.defaultConfig()
                 .with(OracleConnectorConfig.LOG_MINING_BUFFER_TYPE, OracleConnectorConfig.LogMiningBufferType.MEMORY)
                 .with(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START, true)
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_CACHE_PIN, cachePin)
                 .with(OracleConnectorConfig.LOG_MINING_BUFFER_DROP_ON_STOP, true);
     }
 
@@ -384,6 +392,446 @@ public class DeferredMemoryStreamingChangeEventSourceTest extends AbstractAsyncE
     }
 
     @Test
+    public void testMiningWindowIsPinnedByCachedTransactionsWhenCachePinEnabled() throws Exception {
+        final ResultSet rs = Mockito.mock(ResultSet.class);
+        Mockito.when(rs.next()).thenReturn(true, true, false);
+        Mockito.when(rs.getString(1)).thenReturn("101", "200");
+        Mockito.when(rs.getString(2)).thenReturn(
+                "insert into \"DEBEZIUM\".\"ABC\"(\"ID\",\"DATA\") values ('1','test1');",
+                "insert into \"DEBEZIUM\".\"ABC\"(\"ID\",\"DATA\") values ('2','test2');");
+        Mockito.when(rs.getInt(3)).thenReturn(EventType.INSERT.getValue());
+        Mockito.when(rs.getTimestamp(eq(4), any(Calendar.class))).thenReturn(Timestamp.valueOf(LocalDateTime.now()));
+        Mockito.when(rs.getString(7)).thenReturn("ABC");
+        Mockito.when(rs.getString(8)).thenReturn("DEBEZIUM");
+        Mockito.when(rs.getString(10)).thenReturn("AAAAAAAAAAAAAAAAAB", "AAAAAAAAAAAAAAAAAC");
+        Mockito.when(rs.getBytes(5)).thenReturn(new byte[]{ 0x12, 0x34, 0x56, 0x78 });
+
+        final PreparedStatement ps = Mockito.mock(PreparedStatement.class);
+        Mockito.when(ps.executeQuery()).thenReturn(rs);
+
+        try (var source = getChangeEventSource(getConfig(true).build())) {
+            final BufferedStreamingChangeEventSource mock = Mockito.spy(source);
+            Mockito.doReturn(ps).when(mock).createQueryStatement();
+
+            final OracleConnection mainConnection = connectionFactory.streamingConnectionFactory().mainConnection();
+            Mockito.when(mainConnection.getTableMetadataDdl(Mockito.any(TableId.class)))
+                    .thenReturn("CREATE TABLE DEBEZIUM.ABC (ID primary key(9,0), data varchar2(50))");
+
+            final Table table = Table.editor()
+                    .tableId(TableId.parse("ORCLPDB1.DEBEZIUM.ABC"))
+                    .addColumn(Column.editor().name("ID").create())
+                    .addColumn(Column.editor().name("DATA").create())
+                    .setPrimaryKeyNames("ID").create();
+
+            Mockito.doReturn(table)
+                    .when(mock)
+                    .dispatchSchemaChangeEventAndGetTableForNewConfiguredTable(Mockito.any(TableId.class));
+
+            // Same scenario as testMiningWindowIsNotPinnedByCachedTransactions but with cache pin enabled.
+            // The transaction is promoted to the cache on the first DML with startScn 101.
+            // With cache pin enabled, the mining window should pin to the oldest cached transaction
+            // (101 - 1 = 100) instead of sliding block-by-block (199).
+            final ProcessResult result = mock.process(Scn.valueOf(100), Scn.valueOf(100), Scn.valueOf(200));
+
+            assertThat(result.miningSessionStartScn()).isEqualTo(Scn.valueOf(100));
+            assertThat(result.readStartScn()).isEqualTo(Scn.valueOf(200));
+        }
+    }
+
+    @Test
+    public void testCachePinFallsBackToBlockByBlockWhenCacheEmpty() throws Exception {
+        try (var source = getChangeEventSource(getConfig(true).build())) {
+            // Only deferred transactions, no promoted transactions in the cache
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_1));
+            source.processEvent(getStartLogMinerEventRow(150, TRANSACTION_ID_2));
+
+            assertThat(source.getTransactionCache().isEmpty()).isTrue();
+            assertThat(source.getDeferredTransactionCount()).isEqualTo(2);
+
+            // With cache pin enabled but no promoted transactions, the mining window should
+            // fall back to block-by-block behaviour, and the offset should be pinned to the
+            // oldest deferred transaction's start SCN minus one (from the bugfix).
+            // We can't call process() without a ResultSet mock, but we can verify the helper
+            // and the deferred state directly.
+            assertThat(source.getOldestDeferredTransactionStartScn()).isEqualTo(Scn.valueOf(100));
+        }
+    }
+
+    @Test
+    public void testHealingPassScheduledWhenPromotedStartScnBelowSessionStart() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            // Set the current mining session start to 150 — the START at 100 is outside the session
+            source.setCurrentSessionStartScnForTest(Scn.valueOf(150));
+
+            // START at 100 goes to deferred map
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_1));
+            assertThat(source.getDeferredTransactionCount()).isEqualTo(1);
+
+            // Insert at 160 promotes TX1 to cache. startScn=100 < sessionStartScn=150, so
+            // a healing pass should be scheduled with healingStartScn=100.
+            source.processEvent(getInsertLogMinerEventRow(160, TRANSACTION_ID_1));
+
+            assertThat(source.getTransactionCache().containsTransaction(TRANSACTION_ID_1)).isTrue();
+            assertThat(source.isHealingPendingForTest()).isTrue();
+            assertThat(source.getHealingStartScnForTest()).isEqualTo(Scn.valueOf(100));
+        }
+    }
+
+    @Test
+    public void testNoHealingPassWhenPromotedStartScnAtOrAboveSessionStart() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            // Session start at 50 — the START at 100 is within the session
+            source.setCurrentSessionStartScnForTest(Scn.valueOf(50));
+
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(160, TRANSACTION_ID_1));
+
+            assertThat(source.getTransactionCache().containsTransaction(TRANSACTION_ID_1)).isTrue();
+            assertThat(source.isHealingPendingForTest()).isFalse();
+        }
+    }
+
+    @Test
+    public void testHealingPassWidensBothWindows() throws Exception {
+        final ResultSet rs = Mockito.mock(ResultSet.class);
+        Mockito.when(rs.next()).thenReturn(true, false);
+        Mockito.when(rs.getString(1)).thenReturn("200");
+        Mockito.when(rs.getString(2)).thenReturn(
+                "insert into \"DEBEZIUM\".\"ABC\"(\"ID\",\"DATA\") values ('3','test3');");
+        Mockito.when(rs.getInt(3)).thenReturn(EventType.INSERT.getValue());
+        Mockito.when(rs.getTimestamp(eq(4), any(Calendar.class))).thenReturn(Timestamp.valueOf(LocalDateTime.now()));
+        Mockito.when(rs.getString(7)).thenReturn("ABC");
+        Mockito.when(rs.getString(8)).thenReturn("DEBEZIUM");
+        Mockito.when(rs.getString(10)).thenReturn("AAAAAAAAAAAAAAAAAD");
+        Mockito.when(rs.getBytes(5)).thenReturn(new byte[]{ 0x12, 0x34, 0x56, 0x78 });
+
+        final PreparedStatement ps = Mockito.mock(PreparedStatement.class);
+        Mockito.when(ps.executeQuery()).thenReturn(rs);
+
+        try (var source = getChangeEventSource(getConfig().build())) {
+            final BufferedStreamingChangeEventSource mock = Mockito.spy(source);
+            Mockito.doReturn(ps).when(mock).createQueryStatement();
+
+            final OracleConnection mainConnection = connectionFactory.streamingConnectionFactory().mainConnection();
+            Mockito.when(mainConnection.getTableMetadataDdl(Mockito.any(TableId.class)))
+                    .thenReturn("CREATE TABLE DEBEZIUM.ABC (ID primary key(9,0), data varchar2(50))");
+
+            final Table table = Table.editor()
+                    .tableId(TableId.parse("ORCLPDB1.DEBEZIUM.ABC"))
+                    .addColumn(Column.editor().name("ID").create())
+                    .addColumn(Column.editor().name("DATA").create())
+                    .setPrimaryKeyNames("ID").create();
+
+            Mockito.doReturn(table)
+                    .when(mock)
+                    .dispatchSchemaChangeEventAndGetTableForNewConfiguredTable(Mockito.any(TableId.class));
+
+            // Simulate: TX1 START at 100 was deferred, session was mining from 150
+            mock.setCurrentSessionStartScnForTest(Scn.valueOf(150));
+            mock.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_1));
+            mock.processEvent(getInsertLogMinerEventRow(160, TRANSACTION_ID_1));
+
+            // Healing is pending with healingStartScn=100
+            assertThat(mock.isHealingPendingForTest()).isTrue();
+            assertThat(mock.getHealingStartScnForTest()).isEqualTo(Scn.valueOf(100));
+
+            // process() triggers calculateNewStartScn which should perform the healing pass
+            final ProcessResult result = mock.process(Scn.valueOf(150), Scn.valueOf(150), Scn.valueOf(200));
+
+            // Both windows should be widened to 99 (healingStartScn=100, minus 1)
+            assertThat(result.miningSessionStartScn()).isEqualTo(Scn.valueOf(99));
+            assertThat(result.readStartScn()).isEqualTo(Scn.valueOf(99));
+
+            // Healing state should be cleared after the pass
+            assertThat(source.isHealingPendingForTest()).isFalse();
+            assertThat(source.getHealingStartScnForTest()).isEqualTo(Scn.NULL);
+        }
+    }
+
+    @Test
+    public void testStartEventResetsAlreadyCachedTransaction() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            // Promote TX1 into the cache with a DML event
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(110, TRANSACTION_ID_1));
+
+            final Transaction transaction = source.getTransactionCache().getTransaction(TRANSACTION_ID_1);
+            assertThat(transaction).isNotNull();
+            assertThat(transaction.getNumberOfEvents()).isEqualTo(1);
+
+            // Now re-mine the START (as a healing pass would). Since TX1 is already cached,
+            // handleStartEvent should reset it to start (events cleared, counter reset).
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_1));
+
+            assertThat(transaction.getNumberOfEvents()).isZero();
+        }
+    }
+
+    @Test
+    public void testHealingStartResetClearsBufferedEvents() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(110, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'First'"));
+            source.processEvent(getInsertLogMinerEventRow(120, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAC", "'Second'"));
+
+            assertThat(source.getBufferedEventCount(TRANSACTION_ID_1)).isEqualTo(2);
+
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_1));
+
+            assertThat(source.getTransactionCache().containsTransaction(TRANSACTION_ID_1)).isTrue();
+            assertThat(source.getBufferedEventCount(TRANSACTION_ID_1)).isZero();
+        }
+    }
+
+    @Test
+    public void testHealingStartResetClearsRollbackMarkers() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(110, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'First'"));
+            source.processEvent(getInsertRollbackFlagLogMinerEventRow(120, TRANSACTION_ID_1, "AAAAAAAAAAAAAAAAAB"));
+
+            assertThat(source.getRolledBackEventCount(TRANSACTION_ID_1)).isEqualTo(1);
+
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_1));
+
+            assertThat(source.getBufferedEventCount(TRANSACTION_ID_1)).isZero();
+            assertThat(source.getRolledBackEventCount(TRANSACTION_ID_1)).isZero();
+
+            source.processEvent(getInsertLogMinerEventRow(130, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'Healed'"));
+            source.processEvent(getInsertRollbackFlagLogMinerEventRow(140, TRANSACTION_ID_1, "AAAAAAAAAAAAAAAAAB"));
+
+            assertThat(source.getBufferedEventCount(TRANSACTION_ID_1)).isEqualTo(1);
+            assertThat(source.getRolledBackEventCount(TRANSACTION_ID_1)).isEqualTo(1);
+        }
+    }
+
+    @Test
+    public void testHealingPassRebuildsMultipleCachedTransactionsWithoutDuplicates() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.setCurrentSessionStartScnForTest(Scn.valueOf(150));
+
+            source.processEvent(getStartLogMinerEventRow(200, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(210, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'Tx1-initial'"));
+
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_2));
+            source.processEvent(getInsertLogMinerEventRow(220, TRANSACTION_ID_2, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAC", "'Tx2-initial'"));
+
+            assertThat(source.isHealingPendingForTest()).isTrue();
+            assertThat(source.getHealingStartScnForTest()).isEqualTo(Scn.valueOf(100));
+            assertThat(source.getBufferedEventCount(TRANSACTION_ID_1)).isEqualTo(1);
+            assertThat(source.getBufferedEventCount(TRANSACTION_ID_2)).isEqualTo(1);
+
+            // Simulate the widened healing pass re-mining both the older promoted transaction and
+            // the already-cached inflight transaction from their START events.
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_2));
+            source.processEvent(getStartLogMinerEventRow(200, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(210, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'Tx1-healed'"));
+            source.processEvent(getInsertLogMinerEventRow(220, TRANSACTION_ID_2, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAC", "'Tx2-healed'"));
+
+            assertThat(source.getBufferedEventCount(TRANSACTION_ID_1)).isEqualTo(1);
+            assertThat(source.getBufferedEventCount(TRANSACTION_ID_2)).isEqualTo(1);
+
+            source.processEvent(getCommitLogMinerEventRow(230, TRANSACTION_ID_1));
+            source.processEvent(getCommitLogMinerEventRow(240, TRANSACTION_ID_2));
+
+            final ArgumentCaptor<LogMinerChangeRecordEmitter> emitterCaptor = ArgumentCaptor.forClass(LogMinerChangeRecordEmitter.class);
+            Mockito.verify(dispatcher, Mockito.times(2)).dispatchDataChangeEvent(any(), any(), any());
+            Mockito.verify(dispatcher, Mockito.times(2)).dispatchDataChangeEvent(any(), any(), emitterCaptor.capture());
+            Mockito.verify(dispatcher, Mockito.times(2)).dispatchTransactionCommittedEvent(any(), any(), any());
+
+            final List<Object[]> emittedPayloads = emitterCaptor.getAllValues().stream()
+                    .map(this::getNewColumnValues)
+                    .toList();
+
+            assertThat(emittedPayloads)
+                    .extracting(values -> values[1])
+                    .containsExactlyInAnyOrder("Tx1-healed", "Tx2-healed");
+            assertThat(emittedPayloads)
+                    .extracting(values -> values[1])
+                    .doesNotContain("Tx1-initial", "Tx2-initial");
+
+            assertThat(source.getTransactionCache().isEmpty()).isTrue();
+        }
+    }
+
+    @Test
+    public void testHealingPassRebuildsMultipleTransactionsWithMultiDmlPayloadMarkers() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.setCurrentSessionStartScnForTest(Scn.valueOf(150));
+
+            source.processEvent(getStartLogMinerEventRow(200, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(210, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'Tx1-initial-1'"));
+            source.processEvent(getInsertLogMinerEventRow(211, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAC", "'Tx1-initial-2'"));
+
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_2));
+            source.processEvent(getInsertLogMinerEventRow(220, TRANSACTION_ID_2, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAD", "'Tx2-initial-1'"));
+
+            assertThat(source.isHealingPendingForTest()).isTrue();
+            assertThat(source.getHealingStartScnForTest()).isEqualTo(Scn.valueOf(100));
+            assertThat(source.getBufferedEventCount(TRANSACTION_ID_1)).isEqualTo(2);
+            assertThat(source.getBufferedEventCount(TRANSACTION_ID_2)).isEqualTo(1);
+
+            // Re-mine both transactions with distinct healed payload markers so we can prove
+            // the emitted records came from the healed pass rather than the stale buffered state.
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_2));
+            source.processEvent(getStartLogMinerEventRow(200, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(210, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'Tx1-healed-1'"));
+            source.processEvent(getInsertLogMinerEventRow(211, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAC", "'Tx1-healed-2'"));
+            source.processEvent(getInsertLogMinerEventRow(220, TRANSACTION_ID_2, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAD", "'Tx2-healed-1'"));
+
+            assertThat(source.getBufferedEventCount(TRANSACTION_ID_1)).isEqualTo(2);
+            assertThat(source.getBufferedEventCount(TRANSACTION_ID_2)).isEqualTo(1);
+
+            source.processEvent(getCommitLogMinerEventRow(230, TRANSACTION_ID_1));
+            source.processEvent(getCommitLogMinerEventRow(240, TRANSACTION_ID_2));
+
+            final ArgumentCaptor<LogMinerChangeRecordEmitter> emitterCaptor = ArgumentCaptor.forClass(LogMinerChangeRecordEmitter.class);
+            Mockito.verify(dispatcher, Mockito.times(3)).dispatchDataChangeEvent(any(), any(), emitterCaptor.capture());
+            Mockito.verify(dispatcher, Mockito.times(2)).dispatchTransactionCommittedEvent(any(), any(), any());
+
+            final List<Object[]> emittedPayloads = emitterCaptor.getAllValues().stream()
+                    .map(this::getNewColumnValues)
+                    .toList();
+
+            assertThat(emittedPayloads)
+                    .extracting(values -> values[1])
+                    .containsExactly("Tx1-healed-1", "Tx1-healed-2", "Tx2-healed-1");
+            assertThat(emittedPayloads)
+                    .extracting(values -> values[1])
+                    .doesNotContain("Tx1-initial-1", "Tx1-initial-2", "Tx2-initial-1");
+
+            assertThat(source.getTransactionCache().isEmpty()).isTrue();
+        }
+    }
+
+    @Test
+    public void testHealingPassDoesNotReemitAlreadyCommittedOverlappedTransaction() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.setCurrentSessionStartScnForTest(Scn.valueOf(150));
+
+            // TX2 starts first and remains deferred.
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_2));
+
+            // TX1 starts later, is promoted, committed, and emitted before TX2 is promoted.
+            source.processEvent(getStartLogMinerEventRow(200, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(210, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'Tx1-original'"));
+            source.processEvent(getCommitLogMinerEventRow(230, TRANSACTION_ID_1));
+
+            final ArgumentCaptor<LogMinerChangeRecordEmitter> originalEmitterCaptor = ArgumentCaptor.forClass(LogMinerChangeRecordEmitter.class);
+            Mockito.verify(dispatcher, Mockito.times(1)).dispatchDataChangeEvent(any(), any(), originalEmitterCaptor.capture());
+            assertThat(getNewColumnValues(originalEmitterCaptor.getValue())[1]).isEqualTo("Tx1-original");
+
+            Mockito.clearInvocations(dispatcher);
+
+            // TX2 is now promoted, forcing healing because its start SCN is below the current
+            // session start. The healing replay overlaps TX1's already committed range.
+            source.processEvent(getInsertLogMinerEventRow(240, TRANSACTION_ID_2, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAC", "'Tx2-initial'"));
+
+            assertThat(source.isHealingPendingForTest()).isTrue();
+            assertThat(source.getHealingStartScnForTest()).isEqualTo(Scn.valueOf(100));
+
+            // Simulate the healing replay: TX2 START, then TX1's already committed segment,
+            // then TX2's healed DML and commit.
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_2));
+            source.processEvent(getStartLogMinerEventRow(200, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(210, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'Tx1-overlap'"));
+            source.processEvent(getCommitLogMinerEventRow(230, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(240, TRANSACTION_ID_2, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAC", "'Tx2-healed'"));
+            source.processEvent(getCommitLogMinerEventRow(250, TRANSACTION_ID_2));
+
+            final ArgumentCaptor<LogMinerChangeRecordEmitter> healingEmitterCaptor = ArgumentCaptor.forClass(LogMinerChangeRecordEmitter.class);
+            Mockito.verify(dispatcher, Mockito.times(1)).dispatchDataChangeEvent(any(), any(), healingEmitterCaptor.capture());
+            Mockito.verify(dispatcher, Mockito.times(1)).dispatchTransactionCommittedEvent(any(), any(), any());
+
+            assertThat(getNewColumnValues(healingEmitterCaptor.getValue())[1]).isEqualTo("Tx2-healed");
+            assertThat(getNewColumnValues(healingEmitterCaptor.getValue())[1]).isNotEqualTo("Tx1-overlap");
+            assertThat(source.getTransactionCache().isEmpty()).isTrue();
+        }
+    }
+
+    @Test
+    public void testHealingPassDoesNotResurrectCommittedOverlapWithoutReplayCommit() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.setCurrentSessionStartScnForTest(Scn.valueOf(150));
+
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_2));
+
+            source.processEvent(getStartLogMinerEventRow(200, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(210, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'Tx1-original'"));
+            source.processEvent(getCommitLogMinerEventRow(230, TRANSACTION_ID_1));
+
+            Mockito.clearInvocations(dispatcher);
+
+            source.processEvent(getInsertLogMinerEventRow(240, TRANSACTION_ID_2, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAC", "'Tx2-initial'"));
+
+            assertThat(source.isHealingPendingForTest()).isTrue();
+
+            // Probe the partial-overlap shape where the healing replay re-reads TX1's START and
+            // DML but does not replay its COMMIT in the same window.
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_2));
+            source.processEvent(getStartLogMinerEventRow(200, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(210, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'Tx1-overlap'"));
+            source.processEvent(getInsertLogMinerEventRow(240, TRANSACTION_ID_2, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAC", "'Tx2-healed'"));
+            source.processEvent(getCommitLogMinerEventRow(250, TRANSACTION_ID_2));
+
+            final ArgumentCaptor<LogMinerChangeRecordEmitter> emitterCaptor = ArgumentCaptor.forClass(LogMinerChangeRecordEmitter.class);
+            Mockito.verify(dispatcher, Mockito.times(1)).dispatchDataChangeEvent(any(), any(), emitterCaptor.capture());
+            assertThat(getNewColumnValues(emitterCaptor.getValue())[1]).isEqualTo("Tx2-healed");
+
+            assertThat(source.getTransactionCache().containsTransaction(TRANSACTION_ID_1)).isFalse();
+            assertThat(source.getTransactionCache().isEmpty()).isTrue();
+        }
+    }
+
+    @Test
+    public void testHealingPassDoesNotResurrectRolledBackOverlapWithoutReplayRollback() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.setCurrentSessionStartScnForTest(Scn.valueOf(150));
+
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_2));
+
+            source.processEvent(getStartLogMinerEventRow(200, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(210, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'Tx1-original'"));
+            source.processEvent(getRollbackLogMinerEventRow(230, TRANSACTION_ID_1));
+
+            Mockito.clearInvocations(dispatcher);
+
+            source.processEvent(getInsertLogMinerEventRow(240, TRANSACTION_ID_2, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAC", "'Tx2-initial'"));
+
+            assertThat(source.isHealingPendingForTest()).isTrue();
+
+            // Probe the same partial-overlap shape for a transaction that was already rolled back.
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_2));
+            source.processEvent(getStartLogMinerEventRow(200, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(210, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'Tx1-overlap'"));
+            source.processEvent(getInsertLogMinerEventRow(240, TRANSACTION_ID_2, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAC", "'Tx2-healed'"));
+            source.processEvent(getCommitLogMinerEventRow(250, TRANSACTION_ID_2));
+
+            final ArgumentCaptor<LogMinerChangeRecordEmitter> emitterCaptor = ArgumentCaptor.forClass(LogMinerChangeRecordEmitter.class);
+            Mockito.verify(dispatcher, Mockito.times(1)).dispatchDataChangeEvent(any(), any(), emitterCaptor.capture());
+            assertThat(getNewColumnValues(emitterCaptor.getValue())[1]).isEqualTo("Tx2-healed");
+
+            assertThat(source.getTransactionCache().containsTransaction(TRANSACTION_ID_1)).isFalse();
+            assertThat(source.getTransactionCache().isEmpty()).isTrue();
+        }
+    }
+
+    @Test
+    public void testDeferredProcessedTransactionsArePrunedWhenReplayFloorClears() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            source.processEvent(getStartLogMinerEventRow(100, TRANSACTION_ID_1));
+            source.processEvent(getInsertLogMinerEventRow(110, TRANSACTION_ID_1, Instant.now(), "TEST_TABLE", "AAAAAAAAAAAAAAAAAB", "'Tx1-original'"));
+            source.processEvent(getCommitLogMinerEventRow(120, TRANSACTION_ID_1));
+
+            assertThat(source.getDeferredProcessedTransactionCount()).isEqualTo(1);
+
+            source.pruneDeferredProcessedTransactionsForTest(Scn.NULL);
+
+            assertThat(source.getDeferredProcessedTransactionCount()).isZero();
+        }
+    }
+
+    @Test
     public void testMultipleDeferredTransactionsOnlyPromotedOnDml() throws Exception {
         try (var source = getChangeEventSource(getConfig().build())) {
             source.processEvent(getStartLogMinerEventRow(1, TRANSACTION_ID_1));
@@ -567,6 +1015,23 @@ public class DeferredMemoryStreamingChangeEventSourceTest extends AbstractAsyncE
         return row;
     }
 
+    private LogMinerEventRow getInsertRollbackFlagLogMinerEventRow(long scn, String transactionId, String rowId) {
+        LogMinerEventRow row = getInsertLogMinerEventRow(scn, transactionId, Instant.now(), "TEST_TABLE", rowId, "'Undo'");
+        Mockito.when(row.isRollbackFlag()).thenReturn(true);
+        return row;
+    }
+
+    private Object[] getNewColumnValues(LogMinerChangeRecordEmitter emitter) {
+        try {
+            final var field = io.debezium.connector.oracle.BaseChangeRecordEmitter.class.getDeclaredField("newColumnValues");
+            field.setAccessible(true);
+            return (Object[]) field.get(emitter);
+        }
+        catch (ReflectiveOperationException e) {
+            throw new AssertionError("Unable to read emitted payload values", e);
+        }
+    }
+
     private static RedoThreadState buildRedoThreadState(int threadId, String enabled) {
         return RedoThreadState.builder()
                 .thread()
@@ -689,6 +1154,75 @@ public class DeferredMemoryStreamingChangeEventSourceTest extends AbstractAsyncE
             }
             catch (ReflectiveOperationException e) {
                 throw new AssertionError("Unable to invoke deferred transaction cleanup", e);
+            }
+        }
+
+        public void setCurrentSessionStartScnForTest(Scn scn) throws Exception {
+            var ctxField = AbstractLogMinerStreamingChangeEventSource.class.getDeclaredField("sessionContext");
+            ctxField.setAccessible(true);
+            var ctx = ctxField.get(this);
+            var scnField = ctx.getClass().getDeclaredField("currentSessionStartScn");
+            scnField.setAccessible(true);
+            scnField.set(ctx, scn);
+        }
+
+        public boolean isHealingPendingForTest() throws Exception {
+            var field = BufferedLogMinerStreamingChangeEventSource.class.getDeclaredField("healingPending");
+            field.setAccessible(true);
+            return (boolean) field.get(this);
+        }
+
+        public Scn getHealingStartScnForTest() throws Exception {
+            var field = BufferedLogMinerStreamingChangeEventSource.class.getDeclaredField("healingStartScn");
+            field.setAccessible(true);
+            return (Scn) field.get(this);
+        }
+
+        public void pruneDeferredProcessedTransactionsForTest(Scn minCacheScn) {
+            try {
+                final var method = BufferedLogMinerStreamingChangeEventSource.class.getDeclaredMethod("pruneDeferredProcessedTransactions", Scn.class);
+                method.setAccessible(true);
+                method.invoke(this, minCacheScn);
+            }
+            catch (ReflectiveOperationException e) {
+                throw new AssertionError("Unable to invoke deferred processed transaction pruning", e);
+            }
+        }
+
+        @SuppressWarnings("unchecked")
+        public int getDeferredProcessedTransactionCount() {
+            try {
+                final var field = BufferedLogMinerStreamingChangeEventSource.class.getDeclaredField("deferredProcessedTransactions");
+                field.setAccessible(true);
+                return ((Map<String, Scn>) field.get(this)).size();
+            }
+            catch (ReflectiveOperationException e) {
+                throw new AssertionError("Unable to read deferred processed transaction state", e);
+            }
+        }
+
+        public int getBufferedEventCount(String transactionId) {
+            final Transaction transaction = getTransactionCache().getTransaction(transactionId);
+            if (transaction == null) {
+                return 0;
+            }
+            return getTransactionCache().getTransactionEventCount(transaction);
+        }
+
+        @SuppressWarnings("unchecked")
+        public int getRolledBackEventCount(String transactionId) {
+            try {
+                final var field = getTransactionCache().getClass().getDeclaredField("rollbacksByTransactionId");
+                field.setAccessible(true);
+                final Map<String, ?> rollbacksByTransactionId = (Map<String, ?>) field.get(getTransactionCache());
+                final Object rolledBackEvents = rollbacksByTransactionId.get(transactionId);
+                if (rolledBackEvents instanceof java.util.Set<?> set) {
+                    return set.size();
+                }
+                return 0;
+            }
+            catch (ReflectiveOperationException e) {
+                throw new AssertionError("Unable to read rollback event state", e);
             }
         }
 

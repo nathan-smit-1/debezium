@@ -458,4 +458,38 @@ public class OracleConnectorConfigTest {
         final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(config);
         assertThat(connectorConfig.getLogMiningDeferredTransactionRetention()).isEqualTo(Duration.ofHours(1));
     }
+
+    @Test
+    public void shouldDefaultDeferredTransactionCachePinToFalse() {
+        final Configuration config = Configuration.create()
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "myserver")
+                .build();
+        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(config);
+        assertThat(connectorConfig.isDeferredLogMinerTransactionCachePinEnabled()).isFalse();
+    }
+
+    @Test
+    public void shouldEnableDeferredTransactionCachePinWithDeferredStart() {
+        final Configuration config = Configuration.create()
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "myserver")
+                .with(OracleConnectorConfig.CONNECTOR_ADAPTER, "logminer")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_TYPE, OracleConnectorConfig.LogMiningBufferType.MEMORY)
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START, true)
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_CACHE_PIN, true)
+                .build();
+        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(config);
+        assertThat(connectorConfig.isDeferredLogMinerTransactionCachePinEnabled()).isTrue();
+    }
+
+    @Test
+    public void shouldDisableDeferredTransactionCachePinWithUnbufferedAdapter() {
+        final Configuration config = Configuration.create()
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "myserver")
+                .with(OracleConnectorConfig.CONNECTOR_ADAPTER, "logminer_unbuffered")
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START, true)
+                .with(OracleConnectorConfig.LOG_MINING_BUFFER_DEFERRED_TRANSACTION_CACHE_PIN, true)
+                .build();
+        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(config);
+        assertThat(connectorConfig.isDeferredLogMinerTransactionCachePinEnabled()).isFalse();
+    }
 }

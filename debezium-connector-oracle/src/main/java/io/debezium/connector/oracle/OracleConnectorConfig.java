@@ -766,6 +766,20 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     "The mining window is not pinned by transactions, allowing a block-by-block sliding window.")
             .withDeprecatedAliases("log.mining.buffer.memory.legacy.transaction.start");
 
+    public static final Field LOG_MINING_BUFFER_DEFERRED_TRANSACTION_CACHE_PIN = Field.create("log.mining.buffer.deferred.transaction.cache.pin")
+            .withDisplayName("Pin deferred mining window to cached transactions")
+            .withType(Type.BOOLEAN)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.LOW)
+            .withDefault(false)
+            .withDescription("Controls whether the mining window is pinned to the oldest promoted (DML-bearing) " +
+                    "transaction in the cache when using deferred transaction start behavior. " +
+                    "When set to true, the mining window is pinned to the oldest cached transaction's start SCN, " +
+                    "similar to the non-deferred path, but only for transactions that have emitted DML. " +
+                    "When set to false (the default), the mining window slides block-by-block and is not pinned " +
+                    "by transactions in the cache. This option has no effect when " +
+                    "log.mining.buffer.deferred.transaction.start is not enabled.");
+
     public static final Field LOG_MINING_BUFFER_DEFERRED_TRANSACTION_RETENTION_MS = Field.create("log.mining.buffer.deferred.transaction.retention.ms")
             .withDisplayName("Deferred transaction retention")
             .withType(Type.LONG)
@@ -914,6 +928,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     LOG_MINING_CLIENTID_EXCLUDE_LIST,
                     LOG_MINING_RESUME_POSITION_INTERVAL_MS,
                     LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START,
+                    LOG_MINING_BUFFER_DEFERRED_TRANSACTION_CACHE_PIN,
                     LOG_MINING_BUFFER_DEFERRED_TRANSACTION_RETENTION_MS,
                     LOG_MINING_PATH_DICTIONARY,
                     CAPTURE_MODE,
@@ -1008,6 +1023,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     private final boolean logMiningBufferTrackCommitTimestamp;
     private final boolean logMiningBufferTrackStartTimestamp;
     private final boolean logMiningDeferredTransactionStart;
+    private final boolean logMiningDeferredTransactionCachePin;
     private final Duration logMiningDeferredTransactionRetention;
 
     private final String openLogReplicatorSource;
@@ -1102,6 +1118,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
         this.logMiningBufferTrackCommitTimestamp = config.getBoolean(LOG_MINING_BUFFER_TRACK_COMMIT_TIMESTAMP);
         this.logMiningBufferTrackStartTimestamp = config.getBoolean(LOG_MINING_BUFFER_TRACK_START_TIMESTAMP);
         this.logMiningDeferredTransactionStart = config.getBoolean(LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START);
+        this.logMiningDeferredTransactionCachePin = config.getBoolean(LOG_MINING_BUFFER_DEFERRED_TRANSACTION_CACHE_PIN);
         this.logMiningDeferredTransactionRetention = Duration.ofMillis(config.getLong(LOG_MINING_BUFFER_DEFERRED_TRANSACTION_RETENTION_MS));
 
         this.logMiningEhCacheConfiguration = config.subset("log.mining.buffer.ehcache", false);
@@ -2230,6 +2247,18 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     }
 
     /**
+     * Whether the mining window is pinned to the oldest promoted (DML-bearing) transaction in the cache
+     * when using deferred transaction start behavior. Has no effect when deferred transaction start is
+     * not enabled.
+     */
+    public boolean isDeferredLogMinerTransactionCachePinEnabled() {
+        if (ConnectorAdapter.LOG_MINER.equals(getConnectorAdapter())) {
+            return logMiningDeferredTransactionCachePin;
+        }
+        return false;
+    }
+
+    /**
      * Adjustment to be subtracted from the {@code LAST_REDO_SCN} in {@code V$THREAD}.
      */
     public Integer getLogMiningRedoThreadScnAdjustment() {
@@ -2538,6 +2567,12 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                         field.name(), LOB_ENABLED.name()));
                 return 1;
             }
+        }
+        if (config.getBoolean(LOG_MINING_BUFFER_DEFERRED_TRANSACTION_CACHE_PIN)
+                && !config.getBoolean(LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START)) {
+            LOGGER.warn("'{}' only applies when '{}' is enabled, setting will be ignored.",
+                    LOG_MINING_BUFFER_DEFERRED_TRANSACTION_CACHE_PIN.name(),
+                    LOG_MINING_BUFFER_DEFERRED_TRANSACTION_START.name());
         }
         return 0;
     }

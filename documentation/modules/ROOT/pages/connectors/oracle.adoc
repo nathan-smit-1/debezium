@@ -1206,6 +1206,10 @@ If you use the `memory` buffer setting, be sure that the amount of memory that y
 
 When you set xref:oracle-property-log-mining-buffer-deferred-transaction-start[`log.mining.buffer.deferred.transaction.start`] to `true`, the connector retains lightweight metadata for transactions that emit only a `START` event until a DML event promotes the transaction into the main cache.
 To limit how long the connector retains metadata for transactions that never emit DML, set xref:oracle-property-log-mining-buffer-deferred-transaction-retention-ms[`log.mining.buffer.deferred.transaction.retention.ms`].
+By default, the mining window slides block-by-block and is not pinned by transactions in the cache.
+To pin the mining window to the oldest promoted (DML-bearing) transaction in the cache, set xref:oracle-property-log-mining-buffer-deferred-transaction-cache-pin[`log.mining.buffer.deferred.transaction.cache.pin`] to `true`.
+This is similar to the non-deferred path, but only transactions that have emitted DML pin the window, so transactions that never progress beyond `START` do not widen the mining window.
+As with the non-deferred path, if a pinned transaction's start SCN ages out of the available redo logs, the connector stops and a re-snapshot is required.
 
 ifdef::community[]
 [[oracle-event-buffering-infinispan]]
@@ -4714,6 +4718,13 @@ If `log.mining.archive.log.only.mode` is not enabled, this setting is not used.
 When set to `true`, the connector stores only lightweight transaction metadata after a `START` event and promotes the transaction into the main cache only after the first data-bearing event arrives.
 
 This option cannot be enabled when xref:oracle-property-lob-enabled[`lob.enabled`] is set to `true`.
+
+|[[oracle-property-log-mining-buffer-deferred-transaction-cache-pin]]<<oracle-property-log-mining-buffer-deferred-transaction-cache-pin, `log.mining.buffer.deferred.transaction.cache.pin`>>
+|`false`
+|Boolean value that specifies whether the mining window is pinned to the oldest promoted (DML-bearing) transaction in the cache when deferred transaction start behavior is enabled.
+When set to `true`, the mining window is pinned to the oldest cached transaction's start SCN, similar to the non-deferred path, but only for transactions that have emitted DML.
+When set to `false` (the default), the mining window slides block-by-block and is not pinned by transactions in the cache.
+This option has no effect when `log.mining.buffer.deferred.transaction.start` is not enabled.
 
 |[[oracle-property-log-mining-transaction-retention-ms]]<<oracle-property-log-mining-transaction-retention-ms, `log.mining.transaction.retention.ms`>>
 |`0`

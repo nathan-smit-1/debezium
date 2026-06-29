@@ -189,6 +189,8 @@ public class InfinispanLogMinerTransactionCache extends AbstractLogMinerTransact
 
     @Override
     public void resetTransactionToStart(InfinispanTransaction transaction) {
+        removeTransactionEvents(transaction);
+        eventIdsByTransactionId.put(transaction.getTransactionId(), new TreeSet<>());
         super.resetTransactionToStart(transaction);
         syncTransaction(transaction);
     }

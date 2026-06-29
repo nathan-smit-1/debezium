@@ -178,6 +178,12 @@ public class MemoryLogMinerTransactionCache extends AbstractLogMinerTransactionC
     }
 
     @Override
+    public void resetTransactionToStart(MemoryTransaction transaction) {
+        removeTransactionEvents(transaction);
+        super.resetTransactionToStart(transaction);
+    }
+
+    @Override
     public void syncTransaction(MemoryTransaction transaction) {
         // Changing the heap instance is sufficient, therefore this is a no-op
     }

@@ -201,6 +201,8 @@ public class EhcacheLogMinerTransactionCache extends AbstractLogMinerTransaction
 
     @Override
     public void resetTransactionToStart(EhcacheTransaction transaction) {
+        removeTransactionEvents(transaction);
+        eventIdsByTransactionId.put(transaction.getTransactionId(), new TreeSet<>());
         super.resetTransactionToStart(transaction);
         syncTransaction(transaction);
     }

@@ -88,6 +88,10 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
     private Scn lastLoggedWindowAdvanceScn = Scn.NULL;
 
     private final Map<String, DeferredTransaction> deferredTransactions = new HashMap<>();
+    private final Map<String, Scn> deferredProcessedTransactions = new HashMap<>();
+
+    private boolean healingPending = false;
+    private Scn healingStartScn = Scn.NULL;
 
     /**
      * Lightweight metadata record for a deferred transaction that has not yet emitted any DML events.
@@ -336,6 +340,52 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
         return getProcessedTransactionsCache().containsKey(transactionId);
     }
 
+    private boolean isDeferredTransactionRecentlyProcessed(String transactionId) {
+        return getConfig().isDeferredLogMinerTransactionStartBehaviorEnabled()
+                && !Strings.isNullOrEmpty(transactionId)
+                && deferredProcessedTransactions.containsKey(transactionId);
+    }
+
+    private void recordDeferredProcessedTransaction(String transactionId, Scn eventScn) {
+        if (getConfig().isDeferredLogMinerTransactionStartBehaviorEnabled() && !Strings.isNullOrEmpty(transactionId) && eventScn != null) {
+            deferredProcessedTransactions.put(transactionId, eventScn);
+        }
+    }
+
+    private void pruneDeferredProcessedTransactions(Scn minCacheScn) {
+        if (!getConfig().isDeferredLogMinerTransactionStartBehaviorEnabled()) {
+            deferredProcessedTransactions.clear();
+            return;
+        }
+
+        final Scn replayFloorScn = getDeferredReplayFloorScn(minCacheScn);
+        if (replayFloorScn.isNull()) {
+            deferredProcessedTransactions.clear();
+            return;
+        }
+
+        deferredProcessedTransactions.entrySet().removeIf(entry -> entry.getValue().compareTo(replayFloorScn) < 0);
+    }
+
+    private Scn getDeferredReplayFloorScn(Scn minCacheScn) {
+        Scn replayFloorScn = Scn.NULL;
+
+        final Scn oldestDeferredStartScn = getOldestDeferredTransactionStartScn();
+        if (!oldestDeferredStartScn.isNull()) {
+            replayFloorScn = oldestDeferredStartScn;
+        }
+
+        if (!minCacheScn.isNull() && (replayFloorScn.isNull() || minCacheScn.compareTo(replayFloorScn) < 0)) {
+            replayFloorScn = minCacheScn;
+        }
+
+        if (healingPending && !healingStartScn.isNull() && (replayFloorScn.isNull() || healingStartScn.compareTo(replayFloorScn) < 0)) {
+            replayFloorScn = healingStartScn;
+        }
+
+        return replayFloorScn;
+    }
+
     private boolean hasSchemaChangeBeenSeen(LogMinerEventRow event) {
         return getSchemaChangesCache().containsKey(event.getScn().toString());
     }
@@ -398,8 +448,21 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
     @Override
     protected void handleStartEvent(LogMinerEventRow event) {
         final String transactionId = event.getTransactionId();
+        if (isDeferredTransactionRecentlyProcessed(transactionId)) {
+            LOGGER.debug("Transaction {} was already terminal in deferred replay guard, START skipped.", transactionId);
+            return;
+        }
+
         if (!isRecentlyProcessed(transactionId)) {
             if (getConfig().isDeferredLogMinerTransactionStartBehaviorEnabled() && !Strings.isNullOrEmpty(transactionId)) {
+                // If the transaction is already in the cache, this START was re-mined by a healing
+                // pass. Reset its events so re-fetched DML replaces the existing events cleanly.
+                final Transaction cached = getTransactionCache().getTransaction(transactionId);
+                if (cached != null) {
+                    LOGGER.debug("Transaction {} already in cache, START re-mined, resetting events.", transactionId);
+                    getTransactionCache().resetTransactionToStart(cached);
+                    return;
+                }
                 deferredTransactions.computeIfAbsent(transactionId, id -> {
                     LOGGER.trace("Deferring transaction {} start event.", id);
                     return new DeferredTransaction(id, event.getScn(), event.getChangeTime(),
@@ -423,6 +486,11 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
     @Override
     protected void handleCommitEvent(LogMinerEventRow row) throws InterruptedException {
         final String transactionId = row.getTransactionId();
+        if (isDeferredTransactionRecentlyProcessed(transactionId)) {
+            LOGGER.debug("\tTransaction is already terminal in deferred replay guard, commit skipped.");
+            return;
+        }
+
         if (isRecentlyProcessed(transactionId)) {
             LOGGER.debug("\tTransaction is already committed, skipped.");
             return;
@@ -611,6 +679,7 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
             getMetrics().setBufferedEventCount(getTransactionCache().getTransactionEvents());
         }
         else if (removedDeferredTransaction) {
+            recordDeferredProcessedTransaction(transactionId, commitScn);
             getEventDispatcher().dispatchHeartbeatEvent(getPartition(), getOffsetContext());
             getMetrics().setActiveTransactionCount(getTransactionCache().getTransactionCount());
             getMetrics().setBufferedEventCount(getTransactionCache().getTransactionEvents());
@@ -622,6 +691,11 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
     @Override
     protected void handleRollbackEvent(LogMinerEventRow event) {
         final String transactionId = event.getTransactionId();
+        if (isDeferredTransactionRecentlyProcessed(transactionId)) {
+            LOGGER.debug("Transaction {} was already terminal in deferred replay guard, rollback skipped.", transactionId);
+            return;
+        }
+
         if (getTransactionCache().containsTransaction(transactionId)) {
             LOGGER.debug("Transaction {} was rolled back.", transactionId);
             finalizeTransaction(transactionId, event.getScn(), true);
@@ -630,6 +704,7 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
         }
         else if (removeDeferredTransaction(transactionId)) {
             LOGGER.debug("Transaction {} was in deferred state, removed on rollback.", transactionId);
+            recordDeferredProcessedTransaction(transactionId, event.getScn());
         }
         else {
             LOGGER.debug("Transaction {} not found in cache, no events to rollback.", transactionId);
@@ -846,6 +921,8 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
             getSchemaChangesCache().removeIf(e -> true);
         }
 
+        pruneDeferredProcessedTransactions(minCacheScn);
+
         if (!lastProcessedScn.isNull() && lastProcessedScn.compareTo(endScn) < 0) {
             // The last processed SCN is before the end SCN for this mining step, so the next read position
             // should start at this SCN position.
@@ -855,9 +932,47 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
         getMetrics().setOldestScnDetails(minCacheScn, minCacheScnChangeTime);
 
         if (getConfig().isDeferredLogMinerTransactionStartBehaviorEnabled()) {
-            // When using deferred transaction start behavior, the mining window should not be pinned
-            // by transactions in the cache. Always use a sliding window block-by-block.
-            final Scn miningSessionStartScn = endScn.subtract(Scn.ONE);
+            // When using deferred transaction start behavior, the mining window is not pinned by
+            // deferred (no-DML) transactions. When cache pin is disabled (the default), the mining
+            // window slides block-by-block. When cache pin is enabled, the mining window is pinned
+            // to the oldest promoted (DML-bearing) transaction in the cache, similar to the non-deferred
+            // path but excluding the noise from transactions that never emitted DML.
+            final Scn miningSessionStartScn;
+            final Scn readStartScn;
+            if (healingPending && !healingStartScn.isNull()) {
+                // A healing pass is needed because a deferred transaction was promoted with a START
+                // SCN below the mining session start. Widen both the mining session and the fetch
+                // query to re-mine from the oldest affected transaction's START so LogMiner can
+                // resolve the transaction and return any COMMIT events that were previously missed.
+                // The fetch is also widened so the missed COMMIT (which was in a prior fetch range)
+                // is re-fetched. DML re-fetched during the healing pass is deduplicated by
+                // resetTransactionToStart, which is triggered when handleStartEvent sees the START
+                // for an already-cached transaction.
+                final Scn healingLowerBound;
+                if (!minCacheScn.isNull() && minCacheScn.compareTo(healingStartScn) < 0) {
+                    healingLowerBound = minCacheScn;
+                }
+                else {
+                    healingLowerBound = healingStartScn;
+                }
+                LOGGER.debug("Performing healing pass: widening mining session and fetch to SCN {}", healingLowerBound.subtract(Scn.ONE));
+                miningSessionStartScn = healingLowerBound.subtract(Scn.ONE);
+                readStartScn = healingLowerBound.subtract(Scn.ONE);
+                healingPending = false;
+                healingStartScn = Scn.NULL;
+            }
+            else if (getConfig().isDeferredLogMinerTransactionCachePinEnabled() && !minCacheScn.isNull()) {
+                miningSessionStartScn = applyWindowMaxAdjustment(
+                        minCacheScn.subtract(Scn.ONE),
+                        endScn,
+                        minCacheScn,
+                        minCacheScnChangeTime);
+                readStartScn = endScn;
+            }
+            else {
+                miningSessionStartScn = endScn.subtract(Scn.ONE);
+                readStartScn = endScn;
+            }
 
             // The offset SCN must not advance past the oldest in-flight transaction's start SCN,
             // considering both the deferred metadata map and the promoted (DML-bearing) transaction
@@ -893,7 +1008,7 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
             }
 
             getMetrics().setOffsetScn(getOffsetContext().getScn());
-            return new ProcessResult(miningSessionStartScn, endScn);
+            return new ProcessResult(miningSessionStartScn, readStartScn);
         }
 
         if (!minCacheScn.isNull()) {
@@ -1151,6 +1266,7 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
         }
 
         getTransactionCache().removeAbandonedTransaction(transactionId);
+        recordDeferredProcessedTransaction(transactionId, eventScn);
 
         if (getConfig().isLobEnabled()) {
             getProcessedTransactionsCache().put(transactionId, eventScn.toString());
@@ -1181,6 +1297,11 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
     protected void enqueueEvent(LogMinerEventRow event, LogMinerEvent dispatchedEvent) throws InterruptedException {
         final String transactionId = event.getTransactionId();
 
+        if (isDeferredTransactionRecentlyProcessed(transactionId)) {
+            LOGGER.debug("Transaction {} was already terminal in deferred replay guard, event skipped.", transactionId);
+            return;
+        }
+
         Transaction transaction = getTransactionCache().getTransaction(transactionId);
         if (transaction == null) {
             // Check if this transaction is in the deferred state and promote it
@@ -1191,6 +1312,22 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
                     transaction = createTransaction(deferred);
                     getTransactionCache().addTransaction(transaction);
                     getMetrics().setActiveTransactionCount(getTransactionCache().getTransactionCount());
+
+                    // If the deferred transaction's START SCN is below the current mining session start,
+                    // the START was not in the session when the DML was fetched. LogMiner may not have
+                    // been able to resolve the transaction, which can cause it to silently drop the
+                    // COMMIT when it falls in the same fetch range. Schedule a healing pass that
+                    // widens both the mining session and the fetch query to re-mine from the START,
+                    // allowing LogMiner to resolve the transaction and return the COMMIT.
+                    final Scn currentSessionStartScn = getLogMinerContext().getCurrentSessionStartScn();
+                    if (!currentSessionStartScn.isNull() && deferred.startScn().compareTo(currentSessionStartScn) < 0) {
+                        LOGGER.debug("Scheduling healing pass for transaction {} (startScn={} < sessionStartScn={})",
+                                transactionId, deferred.startScn(), currentSessionStartScn);
+                        healingPending = true;
+                        if (healingStartScn.isNull() || deferred.startScn().compareTo(healingStartScn) < 0) {
+                            healingStartScn = deferred.startScn();
+                        }
+                    }
                 }
             }
 
